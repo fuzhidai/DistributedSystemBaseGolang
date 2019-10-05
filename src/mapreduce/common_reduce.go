@@ -1,5 +1,26 @@
 package mapreduce
 
+import (
+	"encoding/json"
+	"io"
+	"log"
+	"os"
+	"sort"
+)
+
+// implement sort
+type keyValues []KeyValue
+
+func (pair keyValues) Len() int {
+	return len(pair)
+}
+func (pair keyValues) Swap(i, j int) {
+	pair[i], pair[j] = pair[j], pair[i]
+}
+func (pair keyValues) Less(i, j int) bool {
+	return pair[i].Key < pair[j].Key
+}
+
 func doReduce(
 	jobName string, // the name of the whole MapReduce job
 	reduceTask int, // which reduce task this is
@@ -44,4 +65,45 @@ func doReduce(
 	//
 	// Your code here (Part I).
 	//
+
+	// read the intermediate files for the task
+	var keyValues keyValues
+	for m := 0; m < nMap; m++ {
+		inFileName := reduceName(jobName, m, reduceTask)
+
+		inFile, _ := os.OpenFile(inFileName, os.O_RDONLY, 0755)
+		defer inFile.Close()
+
+		dec := json.NewDecoder(inFile)
+		for {
+			var keyValue KeyValue
+			if err := dec.Decode(&keyValue); err == io.EOF {
+				break
+			} else if err != nil {
+				log.Fatal(err)
+			}
+			keyValues = append(keyValues, keyValue)
+		}
+	}
+
+	// sort the intermediate key/value pairs by key
+	sort.Sort(keyValues)
+	pairMap := make(map[string][]string)
+	for _, value := range keyValues {
+		pair := append(pairMap[value.Key], value.Value)
+		pairMap[value.Key] = pair
+	}
+
+	// create encoder
+	file, _ := os.OpenFile(outFile, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0755)
+	enc := json.NewEncoder(file)
+	defer file.Close()
+
+	for key, value := range pairMap {
+		// call the user-defined reduce function (reduceF) for each key
+		val := reduceF(key, value)
+
+		// and write reduceF's output to disk
+		_ = enc.Encode(&KeyValue{key, val})
+	}
 }
