@@ -71,7 +71,10 @@ func doReduce(
 	for m := 0; m < nMap; m++ {
 		inFileName := reduceName(jobName, m, reduceTask)
 
-		inFile, _ := os.OpenFile(inFileName, os.O_RDONLY, 0755)
+		inFile, err := os.OpenFile(inFileName, os.O_RDONLY, 0666)
+		if err != nil {
+			log.Fatal(err)
+		}
 		defer inFile.Close()
 
 		dec := json.NewDecoder(inFile)
@@ -95,7 +98,12 @@ func doReduce(
 	}
 
 	// create encoder
-	file, _ := os.OpenFile(outFile, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0755)
+	file, err := os.OpenFile(outFile, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+
+	if err != nil {
+		panic(err)
+	}
+
 	enc := json.NewEncoder(file)
 	defer file.Close()
 

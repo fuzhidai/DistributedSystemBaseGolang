@@ -8,4 +8,3 @@ echo "Failed test. Output should be as in mr-testout.txt. Your output differs as
 else
   echo "Passed test" > /dev/stderr
 fi
-

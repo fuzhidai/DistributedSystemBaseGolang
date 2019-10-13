@@ -67,7 +67,7 @@ func doMap(
 	var encs []*json.Encoder
 	for r := 0; r < nReduce; r++ {
 		outFileName := reduceName(jobName, mapTask, r)
-		outFile, _ := os.OpenFile(outFileName, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0755)
+		outFile, _ := os.OpenFile(outFileName, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
 		enc := json.NewEncoder(outFile)
 		encs = append(encs, enc)
 	}
