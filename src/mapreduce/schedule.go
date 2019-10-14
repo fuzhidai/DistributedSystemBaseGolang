@@ -36,6 +36,16 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 
 	var wg sync.WaitGroup
 	workerCh := make(chan chan int)
+	failCh := make(chan int)
+
+	// Handling worker failures
+	go func() {
+		for index := range failCh {
+			wg.Add(1)
+			ch := <-workerCh
+			ch <- index
+		}
+	}()
 
 	go func() {
 		for worker := range registerChan {
@@ -44,8 +54,13 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 
 			go func(worker string, ch chan int) {
 				for index := range ch {
-					call(worker, "Worker.DoTask",
+					res := call(worker, "Worker.DoTask",
 						DoTaskArgs{jobName, mapFiles[index], phase, index, n_other}, nil)
+
+					// Handling worker failures
+					if res == false {
+						failCh <- index
+					}
 					wg.Done()
 					workerCh <- ch
 				}
