@@ -25,6 +25,7 @@ func TestInitialElection2A(t *testing.T) {
 	defer cfg.cleanup()
 
 	cfg.begin("Test (2A): initial election")
+	DPrintf("Test (2A): initial election")
 
 	// is a leader elected?
 	cfg.checkOneLeader()
@@ -53,6 +54,7 @@ func TestReElection2A(t *testing.T) {
 	defer cfg.cleanup()
 
 	cfg.begin("Test (2A): election after network failure")
+	DPrintf("Test (2A): election after network failure")
 
 	leader1 := cfg.checkOneLeader()
 

@@ -17,13 +17,17 @@ package raft
 //   in the same server.
 //
 
-import "sync"
+import (
+	"math/rand"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
 import "labrpc"
 
 // import "bytes"
 // import "labgob"
-
-
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -55,6 +59,37 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	// Persistent state on all servers:
+	currentTerm int    // latest term server has seen (initialized to 0 on first boot, increases monotonically)
+	votedFor    string // candidateId that received vote in current term (or null if none)
+	log         []Log  // log entries
+
+	// Volatile state on all servers:
+	commitIndex int // index of highest log entry known to be committed (initialized to 0, increases monotonically)
+	lastApplied int // index of highest log entry applied to state machine (initialized to 0, increases monotonically)
+
+	// Volatile state on leaders:
+	nextIndex  []int // for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
+	matchIndex []int // for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
+
+	// Timeout
+	timer  chan int // timeout
+	voteCh chan int // vote Channel
+	state  int      // 0 means Follower ； 1 means Candidate ； 2 means Leader
+}
+
+// peer state
+const (
+	Follower  = 0 // Follower
+	Candidate = 1 // Candidate
+	Leader    = 2 // Leader
+)
+
+// each entry contains command for state machine, and term when entry was received by leader (first index is 1)
+type Log struct {
+	LogIndex int
+	Term     int
+	Command  int
 }
 
 // return currentTerm and whether this server
@@ -64,9 +99,12 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+
+	term = rf.currentTerm
+	isleader = rf.state == Leader
+
 	return term, isleader
 }
-
 
 //
 // save Raft's persistent state to stable storage,
@@ -83,7 +121,6 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 }
-
 
 //
 // restore previously persisted state.
@@ -107,15 +144,16 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
-
-
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term         int    // candidate’s term
+	CandidateId  string // candidate requesting vote
+	LastLogIndex int    // index of candidate’s last log entry
+	LastLogTerm  int    // term of candidate’s last log entry
 }
 
 //
@@ -124,6 +162,30 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int  // currentTerm, for candidate to update itself
+	VoteGranted bool // true means candidate received vote
+}
+
+//
+// example AppendEntries RPC arguments structure.
+// field names must start with capital letters!
+//
+type AppendEntriesArgs struct {
+	Term         int    // leader’s term
+	LeaderId     string // so follower can redirect clients
+	PrevLogIndex int    // index of log entry immediately preceding new ones
+	PrevLogTerm  int    // term of prevLogIndex entry
+	Entries      []Log  // log entries to store (empty for heartbeat; may send more than one for efficiency)
+	LeaderCommit int    // leader’s commitIndex
+}
+
+//
+// example AppendEntries RPC reply structure.
+// field names must start with capital letters!
+//
+type AppendEntriesReply struct {
+	Term    int  // currentTerm, for leader to update itself
+	Success bool // true if follower contained entry matching prevLogIndex and prevLogTerm
 }
 
 //
@@ -131,6 +193,82 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+
+	DPrintf("RequestVote —— peer: %d ; currentTerm: %d ; term: %d", rf.me, rf.currentTerm, args.Term)
+
+	if rf.currentTerm > args.Term {
+		// candidate term behind current term
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		return
+	}
+
+	rf.mu.Lock()
+	if rf.currentTerm < args.Term {
+
+		DPrintf("peer %d has vote %s.", rf.me, args.CandidateId)
+
+		// if old leader has something wrong，current peer receive a new term vote，so vote it
+		// a first-come-first-served basis
+		rf.state = Follower
+		rf.currentTerm = args.Term
+		rf.votedFor = args.CandidateId
+
+		// prepare reply
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = true
+	} else {
+
+		// current rf.currentTerm == args.Term
+		// If votedFor is null or candidateId, and candidate’s log is at least as up-to-date as receiver’s log, grant vote
+		if rf.votedFor == "" || (strings.Compare(rf.votedFor, args.CandidateId) == 0 && rf.lastApplied == args.LastLogIndex) {
+
+			rf.state = Follower
+			rf.currentTerm = args.Term
+			rf.votedFor = args.CandidateId
+			reply.VoteGranted = true
+		} else {
+			reply.VoteGranted = false
+		}
+		reply.Term = args.Term
+	}
+	rf.mu.Unlock()
+}
+
+//
+// AppendEntries RPC handler.
+//
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+
+	DPrintf("peer %d get AppendEntries. | term: %d", rf.me, rf.currentTerm)
+
+	// (b) another server establishes itself as leader
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		return
+	}
+
+	DPrintf("peer %d get heartbeat from %s. | term: %d | current: %d", rf.me, args.LeaderId, args.Term, rf.currentTerm)
+	rf.mu.Lock()
+	// whatever you are a follower， so first change or keep peer to Follower
+	rf.state = Follower
+	if args.Term > rf.currentTerm {
+		DPrintf("Old Leader peer %d become Follower.", rf.me)
+
+		// old Leader online.
+		rf.currentTerm = args.Term // second update current term（when old leader back）
+	}
+	rf.mu.Unlock()
+
+	// don't need to close vote channel，because it will close when get the next vote or at the begin of the next vote
+
+	// restart election timeout
+	rf.timer <- 1
+
+	// set reply.
+	reply.Term = rf.currentTerm
+	reply.Success = true
 }
 
 //
@@ -167,6 +305,141 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+// start Timer (election timeout)
+func (rf *Raft) startTimer() {
+
+	// Timer
+	var ticker *time.Ticker
+	for {
+		if rf.state != Leader {
+			// Restart Timer
+			ticker = time.NewTicker(time.Duration(RandInt64(200, 400)) * time.Millisecond)
+		} else {
+			// Leader every 100 ms send a heartBeat
+			ticker = time.NewTicker(time.Duration(100) * time.Millisecond)
+		}
+	Timeout:
+		for {
+			select {
+			case <-ticker.C:
+
+				// while timeout.
+				if rf.state != Leader {
+					// Not Leader，First to collect vote
+					rf.collectVote()
+					// Begin to vote for itself
+					rf.startVote()
+				} else {
+					// Leader send heartbeat
+					rf.sendHeartbeats()
+				}
+			case <-rf.timer:
+				DPrintf("peer %d restart timer.", rf.me)
+
+				// Stop to restart Timer
+				ticker.Stop()
+				break Timeout
+			}
+		}
+	}
+}
+
+// Start vote.
+func (rf *Raft) startVote() {
+
+	rf.state = Candidate              // current peer state is Candidate
+	rf.votedFor = strconv.Itoa(rf.me) // vote itself
+	rf.currentTerm++                  // increase current term
+
+	DPrintf("Peer %d begin to vote, current term is %d", rf.me, rf.currentTerm)
+
+	for server, _ := range rf.peers {
+		if server != rf.me {
+			// start a new go routine to send request vote
+			go func(server int) {
+
+				args := &RequestVoteArgs{rf.currentTerm, strconv.Itoa(rf.me), 0, 0}
+				reply := &RequestVoteReply{}
+
+				DPrintf("Send vote to peer %d.", server)
+
+				// send request vote
+				if rf.sendRequestVote(server, args, reply) {
+
+					if !reply.VoteGranted {
+						// group has haven Leader，so this peer change to Follower
+						rf.state = Follower
+						// current server may have out
+						rf.currentTerm = reply.Term
+					}
+
+					// send message to collect func.
+					rf.voteCh <- 1
+
+				} else {
+					// mean have something wrong with RPC
+				}
+			}(server)
+		}
+	}
+}
+
+// Collect vote
+func (rf *Raft) collectVote() {
+	// first vote to itsel
+	voteNum := 1
+	// init a new vote channel to clean old vote
+	rf.voteCh = make(chan int)
+
+	go func() {
+		// get state for vote from vote channel
+		for range rf.voteCh {
+			// mean vote have finish
+			if rf.state == Follower {
+				return
+			}
+			// add one vote
+			voteNum++
+			// (a) it wins the election
+			if voteNum >= ((len(rf.peers) + 1) / 2) {
+
+				DPrintf("peer: %d become Leader, term is %d \n", rf.me, rf.currentTerm)
+
+				// peer have got enough vote，so it become Leader
+				rf.state = Leader
+				// send heartbeats
+				rf.sendHeartbeats()
+				rf.timer <- 1
+				// finish vote
+				return
+			}
+		}
+	}()
+}
+
+// send heartbeats
+func (rf *Raft) sendHeartbeats() {
+
+	DPrintf("peer %d send heartbeats.", rf.me)
+
+	// send heartbeat
+	go func() {
+		for server, _ := range rf.peers {
+			if server != rf.me {
+				go func(server int) {
+					args := &AppendEntriesArgs{rf.currentTerm, strconv.Itoa(rf.me), 0, 0, nil, 0}
+					reply := &AppendEntriesReply{}
+					rf.sendAppendEntries(server, args, reply)
+				}(server)
+			}
+		}
+	}()
+}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -188,7 +461,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
 
 	return index, term, isLeader
 }
@@ -223,9 +495,24 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 
+	// Set Timer and Set vote channel
+	rf.timer = make(chan int)
+	rf.voteCh = make(chan int)
+
+	go func() {
+		// randomized election timeouts
+		rf.startTimer()
+	}()
+
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-
 	return rf
+}
+
+func RandInt64(min, max int64) int64 {
+	if min >= max || min == 0 || max == 0 {
+		return max
+	}
+	return rand.Int63n(max-min) + min
 }
