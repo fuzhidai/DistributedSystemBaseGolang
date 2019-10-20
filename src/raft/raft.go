@@ -87,7 +87,7 @@ const (
 )
 
 const ElectionTimeout = 1000 * time.Millisecond
-const HeartbeatTimeout = 200 * time.Millisecond
+const HeartbeatTimeout = 100 * time.Millisecond
 
 // each entry contains command for state machine, and term when entry was received by leader (first index is 1)
 type Log struct {
@@ -889,11 +889,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
 	if rf.state == Leader {
-		go func() {
-			rf.sendCommand(command)
-		}()
 
-		index = len(rf.log)
+		index = rf.nextIndex[rf.me]
+		go rf.sendCommand(command)
+
+		// avoid request to quick
+		time.Sleep(HeartbeatTimeout / 2)
+
 		term = rf.currentTerm
 		APrintf("The command is at index %d by %d.", index, rf.me)
 
