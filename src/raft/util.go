@@ -6,8 +6,8 @@ import "log"
 const Debug = 0
 const CDebug = 0
 const BDebug = 0
-const ADebug = 0
-const NDebug = 0
+const ADebug = 1
+const NDebug = 1
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
