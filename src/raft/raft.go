@@ -112,13 +112,13 @@ type Log struct {
 func (rf *Raft) GetState() (int, bool) {
 
 	var term int
-	var isleader bool
+	var isLeader bool
 	// Your code here (2A).
 
 	term = rf.currentTerm
-	isleader = rf.state == Leader
+	isLeader = rf.state == Leader
 
-	return term, isleader
+	return term, isLeader
 }
 
 //

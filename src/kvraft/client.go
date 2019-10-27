@@ -1,9 +1,11 @@
 package raftkv
 
-import "labrpc"
+import (
+	"labrpc"
+	"time"
+)
 import "crypto/rand"
 import "math/big"
-
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
@@ -38,8 +40,41 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 //
 func (ck *Clerk) Get(key string) string {
 
-	// You will have to modify this function.
-	return ""
+	// random choose server.
+	for {
+		time.Sleep(time.Duration(5) * time.Millisecond)
+		for server := range ck.servers {
+
+			// You will have to modify this function.
+			identity := nrand()
+			args := &GetArgs{key, identity}
+			reply := &GetReply{}
+
+			ok := ck.sendGet(server, args, reply)
+
+			// keeps trying forever in the face of all other errors.
+			for !ok {
+				DPrintf("something wrong with args %v", args)
+				ok = ck.sendGet(server, args, reply)
+			}
+
+			// send PRC to Leader successfully. Return fetch value.
+			if !reply.WrongLeader {
+				DPrintf("Get args %v return", args)
+				switch reply.Err {
+				case OK:
+					return reply.Value
+				case ErrNoKey:
+					return ""
+				}
+			}
+		}
+	}
+}
+
+func (ck *Clerk) sendGet(server int, args *GetArgs, reply *GetReply) bool {
+	ok := ck.servers[server].Call("KVServer.Get", args, reply)
+	return ok
 }
 
 //
@@ -54,6 +89,34 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+
+	for {
+		time.Sleep(time.Duration(5) * time.Millisecond)
+		for server := range ck.servers {
+			identity := nrand()
+			args := &PutAppendArgs{key, value, op, identity}
+			reply := &PutAppendReply{}
+
+			ok := ck.sendPutAppend(server, args, reply)
+
+			// keeps trying forever in the face of all other errors.
+			for !ok {
+				DPrintf("something wrong with args %v", args)
+				ok = ck.sendPutAppend(server, args, reply)
+			}
+
+			// send PRC to Leader successfully. Return fetch value.
+			if !reply.WrongLeader {
+				DPrintf("PutAppend args %v return", args)
+				return
+			}
+		}
+	}
+}
+
+func (ck *Clerk) sendPutAppend(server int, args *PutAppendArgs, reply *PutAppendReply) bool {
+	ok := ck.servers[server].Call("KVServer.PutAppend", args, reply)
+	return ok
 }
 
 func (ck *Clerk) Put(key string, value string) {
