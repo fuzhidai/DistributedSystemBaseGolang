@@ -542,7 +542,7 @@ func (rf *Raft) startVote() {
 				reply := &RequestVoteReply{}
 				rf.mu.Unlock()
 
-				DPrintf("Send vote to peer %d.", server)
+				//DPrintf("Send vote to peer %d.", server)
 
 				// send request vote
 				if rf.sendRequestVote(server, args, reply) {
@@ -750,7 +750,7 @@ func (rf *Raft) checkFollowerNeedToAppendThisLog(server int, logIndex int) bool 
 func (rf *Raft) updateCommitIndex() {
 
 	NPrintf("Leader %d current nextIndex %v A, logLen %d ", rf.me, rf.nextIndex, len(rf.log))
-	if res, index := rf.checkIfCanUpdateCommitIndex(); res && rf.log[index].Term == rf.currentTerm {
+	if res, index := rf.checkIfCanUpdateCommitIndex(); res && (rf.log[index].Term == rf.currentTerm || rf.checkAllServerConsistentAtIndex(index, rf.matchIndex)) {
 		NPrintf("Leader %d current commitIndex %v B ", rf.me, rf.commitIndex)
 		//rf.sendApplyMsg(rf.commitIndex, index)
 		rf.commitIndex = index
@@ -762,7 +762,7 @@ func (rf *Raft) updateLastApplyIndex() {
 		if rf.commitIndex > rf.lastApplied {
 			rf.lastApplied++
 			rf.applyCh <- ApplyMsg{true, rf.log[rf.lastApplied].Command, rf.lastApplied}
-			NPrintf("Peer %d apply %d", rf.me, rf.lastApplied)
+			DPrintf("Peer %d apply %d command %v commitIndex %d", rf.me, rf.lastApplied, rf.log[rf.lastApplied].Command, rf.commitIndex)
 		} else {
 			break
 		}
@@ -774,9 +774,23 @@ func (rf *Raft) checkIfCanUpdateCommitIndex() (bool, int) {
 	return index > 0 && index > rf.commitIndex, index
 }
 
+/**
+Handling situations where the timing of a missed submission is caused by a very poor network condition,
+such as a missed submission opportunity, such as currentTerm is 164 but the nextIndex is [166, 166, 166, 166, 166],
+According to the optimization method of the paper,
+The current leader will only submit the log of the current term, and will not submit the log of the previous term
+to prevent the latter from overwriting the former.
+In this case there is never a chance to implement the commit again.
+*/
+func (rf *Raft) checkAllServerConsistentAtIndex(index int, arr []int) bool {
+	var tmp = make([]int, len(arr))
+	copy(tmp, arr)
+	sort.Ints(tmp)
+	return tmp[0] == tmp[len(arr)-1] && rf.log[index].Term < rf.currentTerm
+}
+
 // version 1.0
 func FindValueCountOverHalf(arr []int) int {
-
 	var tmp = make([]int, len(arr))
 	copy(tmp, arr)
 	sort.Ints(tmp)
@@ -911,13 +925,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			rf.sendCommand(command)
 		}
 
-		term = rf.currentTerm
-		APrintf("The command is at index %d command %v by %d.", index, command, rf.me)
+		DPrintf("The command is at index %d command %v by %d.nextIndex %v | lastApplied %d | commitIndex %d", index, command, rf.me, rf.nextIndex, rf.lastApplied, rf.commitIndex)
 
 	} else {
 		isLeader = false
 	}
 	rf.mu.Unlock()
+	term = rf.currentTerm
 
 	return index, term, isLeader
 }

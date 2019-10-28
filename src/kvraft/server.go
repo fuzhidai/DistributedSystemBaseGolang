@@ -5,7 +5,8 @@ import (
 	"labrpc"
 	"log"
 	"raft"
-	"sync"
+	"src/github.com/sasha-s/go-deadlock"
+	"time"
 )
 
 const Debug = 1
@@ -28,7 +29,8 @@ type Op struct {
 }
 
 type KVServer struct {
-	mu      sync.Mutex
+	//	mu      sync.Mutex
+	mu      deadlock.Mutex
 	me      int
 	rf      *raft.Raft
 	applyCh chan raft.ApplyMsg
@@ -39,15 +41,104 @@ type KVServer struct {
 	log           map[string]string
 	requestRecord []int64
 	lastRequest   int64
-	valueCh       chan string
+
+	valueCh    chan string
+	valueState bool
+
+	identityCh    chan int64
+	identityState bool
+
+	dispatchCh  chan string
+	getCh       chan int
+	putAppendCh chan int
+
+	lock *int
+}
+
+func (kv *KVServer) initDispatch() {
+
+	kv.dispatchCh = make(chan string)
+	kv.getCh = make(chan int)
+	kv.putAppendCh = make(chan int)
+	go kv.dispatch()
+}
+
+func (kv *KVServer) dispatch() {
+
+	var queue []string
+	lock := false
+
+	for request := range kv.dispatchCh {
+		switch request {
+		case "getStart":
+			if lock {
+				queue = append(queue, request)
+			} else {
+				lock = true
+				kv.getCh <- 1
+			}
+
+		case "getEnd":
+			if len(queue) > 0 {
+				item := queue[0]
+				queue = queue[1:]
+				switch item {
+				case "getStart":
+					lock = true
+					kv.getCh <- 1
+				case "putAppendStart":
+					lock = true
+					kv.putAppendCh <- 1
+				}
+			} else {
+				lock = false
+			}
+
+		case "putAppendStart":
+			if lock {
+				queue = append(queue, request)
+			} else {
+				lock = true
+				kv.putAppendCh <- 1
+			}
+
+		case "putAppendEnd":
+			if len(queue) > 0 {
+				item := queue[0]
+				queue = queue[1:]
+				switch item {
+				case "getStart":
+					lock = true
+					kv.getCh <- 1
+				case "putAppendStart":
+					lock = true
+					kv.putAppendCh <- 1
+				}
+			} else {
+				lock = false
+			}
+		}
+	}
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 
+	// v1.0
 	// use lock to guarantee invoking linearly.
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
+	//kv.mu.Lock()
+	//defer kv.mu.Unlock()
+
+	// v1.1
+	//kv.dispatchCh <- "getStart"
+	//<- kv.getCh
+	//defer func() {kv.dispatchCh <- "getEnd"}()
+
+	// v1.2
+	for *kv.lock == 1 {
+	}
+	*kv.lock = 1
+	defer func() { *kv.lock = 0 }()
 
 	_, isLeader := kv.rf.GetState()
 	reply.WrongLeader = !isLeader
@@ -56,6 +147,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	if kv.findRecordContainIdentity(args.Identity, kv.requestRecord) {
 		reply.Err = OK
 		reply.Value = kv.getValue(args.Key)
+		DPrintf("return with reply %v", reply)
 		//kv.lastRequest = args.Identity
 		return
 	}
@@ -66,9 +158,36 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 		DPrintf("server %d start args %v", kv.me, args)
 
-		kv.rf.Start(command)
+		//kv.rf.Start(command)
 
-		reply.Value = <-kv.valueCh
+		//reply.Value = <-kv.valueCh
+
+		flag := 0
+		go func(flag *int) {
+			reply.Value = <-kv.valueCh
+			*flag = 1
+		}(&flag)
+
+		kv.valueState = true
+		oldIndex, oldTerm, _ := kv.rf.Start(command)
+		DPrintf("server %d old index %d old term %d", kv.me, oldIndex, oldTerm)
+
+		for index, term := oldIndex, oldTerm; flag == 0 && oldIndex == index && oldTerm == term; {
+			// request to fast will make repeat invoke.
+			time.Sleep(time.Duration(20) * time.Millisecond)
+			index, term, _ = kv.rf.Start(command)
+			DPrintf("server %d current index %d current term %d flag %d", kv.me, index, term, flag)
+		}
+
+		// Leader loses its leadership before the request is committed to the log.
+		if flag == 0 {
+			reply.Err = "LoseLeadership"
+			reply.WrongLeader = true
+			kv.valueState = false
+			kv.valueCh <- ""
+			DPrintf("return with reply %v", reply)
+			return
+		}
 		DPrintf("server %d get value %v", kv.me, reply.Value)
 
 		// Cope with duplicate Clerk requests.
@@ -89,9 +208,21 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 
+	// v1.0
 	// use lock to guarantee invoking linearly.
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
+	//kv.mu.Lock()
+	//defer kv.mu.Unlock()
+
+	// v1.1
+	//kv.dispatchCh <- "putAppendStart"
+	//<- kv.putAppendCh
+	//defer func() {kv.dispatchCh <- "putAppendEnd"}()
+
+	//v1.2
+	for *kv.lock == 1 {
+	}
+	*kv.lock = 1
+	defer func() { *kv.lock = 0 }()
 
 	_, isLeader := kv.rf.GetState()
 	reply.WrongLeader = !isLeader
@@ -108,12 +239,49 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		command := Op{args.Identity, args.Op, args.Key, args.Value}
 		DPrintf("server %d start args %v", kv.me, args)
 
-		kv.rf.Start(command)
+		//kv.rf.Start(command)
 
-		<-kv.valueCh // block to wait to finish consistent.
+		//<-kv.valueCh // block to wait to finish consistent.
+
+		flag := 0
+		go func(flag *int, args *PutAppendArgs) {
+			for identity := range kv.identityCh {
+				DPrintf("identity %d args %v", identity, args)
+				if identity == args.Identity {
+					*flag = 1
+					return
+				} else if identity == -1 {
+					return
+				}
+			}
+		}(&flag, args)
+
+		//kv.identityCh = make(chan int64)
+		kv.identityState = true
+		oldIndex, oldTerm, _ := kv.rf.Start(command)
+		kv.requestRecord = append(kv.requestRecord, args.Identity)
+
+		DPrintf("server %d old index %d old term %d", kv.me, oldIndex, oldTerm)
+
+		for index, term := oldIndex, oldTerm; flag == 0 && oldIndex == index && oldTerm == term; {
+			// request to fast will make repeat invoke.
+			time.Sleep(time.Duration(20) * time.Millisecond)
+			index, term, _ = kv.rf.Start(command)
+			DPrintf("server %d current index %d current term %d flag %d", kv.me, index, term, flag)
+		}
+
+		// Leader loses its leadership before the request is committed to the log.
+		if flag == 0 {
+			reply.Err = "LoseLeadership"
+			reply.WrongLeader = true
+			kv.identityCh <- -1
+			kv.identityState = false
+			DPrintf("return with reply %v", reply)
+			return
+		}
 
 		// Cope with duplicate Clerk requests.
-		kv.requestRecord = append(kv.requestRecord, args.Identity)
+		// kv.requestRecord = append(kv.requestRecord, args.Identity)
 
 		// Free server memory quickly.
 		//if args.Identity != kv.lastRequest {
@@ -138,22 +306,25 @@ func (kv *KVServer) applyCommand() {
 
 		switch command.Operation {
 		case "Get":
-			if _, isLeader := kv.rf.GetState(); isLeader {
+			DPrintf("server %d put command %v.", kv.me, command)
+			if _, isLeader := kv.rf.GetState(); isLeader && kv.valueState {
 				kv.valueCh <- kv.getValue(command.Key)
 			}
 			//DPrintf("server %d over get.", kv.me)
 
 		case "Put":
+			DPrintf("server %d put command %v.", kv.me, command)
 			kv.putValue(command.Key, command.Value)
-			if _, isLeader := kv.rf.GetState(); isLeader {
-				kv.valueCh <- command.Value
+			if _, isLeader := kv.rf.GetState(); isLeader && kv.identityState {
+				kv.identityCh <- command.Identity
 			}
 			//DPrintf("server %d over put.", kv.me)
 
 		case "Append":
+			DPrintf("server %d append command %v.", kv.me, command)
 			kv.appendValue(command.Key, command.Value)
-			if _, isLeader := kv.rf.GetState(); isLeader {
-				kv.valueCh <- command.Value
+			if _, isLeader := kv.rf.GetState(); isLeader && kv.identityState {
+				kv.identityCh <- command.Identity
 			}
 			//DPrintf("server %d over append.", kv.me)
 
@@ -250,6 +421,12 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.log = make(map[string]string)
 	kv.valueCh = make(chan string)
+	kv.identityCh = make(chan int64)
+	//kv.initDispatch()
+
+	lockVal := 0
+	kv.lock = &lockVal // 0 is unlock | 1 is lock.
+
 	kv.initApplyCommand()
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 

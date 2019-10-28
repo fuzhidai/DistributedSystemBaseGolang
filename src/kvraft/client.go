@@ -40,26 +40,26 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 //
 func (ck *Clerk) Get(key string) string {
 
-	// random choose server.
+	// uniquely identify client operations to ensure that the key/value service executes each one just once.
+	identity := nrand()
 	for {
 		time.Sleep(time.Duration(5) * time.Millisecond)
 		for server := range ck.servers {
 
 			// You will have to modify this function.
-			identity := nrand()
 			args := &GetArgs{key, identity}
 			reply := &GetReply{}
 
 			ok := ck.sendGet(server, args, reply)
 
 			// keeps trying forever in the face of all other errors.
-			for !ok {
+			for !ok && reply.Err == OK {
 				DPrintf("something wrong with args %v", args)
 				ok = ck.sendGet(server, args, reply)
 			}
 
 			// send PRC to Leader successfully. Return fetch value.
-			if !reply.WrongLeader {
+			if !reply.WrongLeader && reply.Err == OK {
 				DPrintf("Get args %v return", args)
 				switch reply.Err {
 				case OK:
@@ -90,24 +90,25 @@ func (ck *Clerk) sendGet(server int, args *GetArgs, reply *GetReply) bool {
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
 
+	// uniquely identify client operations to ensure that the key/value service executes each one just once.
+	identity := nrand()
 	for {
 		time.Sleep(time.Duration(5) * time.Millisecond)
 		for server := range ck.servers {
-			identity := nrand()
 			args := &PutAppendArgs{key, value, op, identity}
 			reply := &PutAppendReply{}
 
 			ok := ck.sendPutAppend(server, args, reply)
 
 			// keeps trying forever in the face of all other errors.
-			for !ok {
+			for !ok && reply.Err == OK {
 				DPrintf("something wrong with args %v", args)
 				ok = ck.sendPutAppend(server, args, reply)
 			}
 
 			// send PRC to Leader successfully. Return fetch value.
-			if !reply.WrongLeader {
-				DPrintf("PutAppend args %v return", args)
+			if !reply.WrongLeader && reply.Err == OK {
+				DPrintf("server %d PutAppend args %v return", server, args)
 				return
 			}
 		}

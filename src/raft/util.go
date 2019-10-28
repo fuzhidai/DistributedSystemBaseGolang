@@ -3,7 +3,7 @@ package raft
 import "log"
 
 // Debugging
-const Debug = 0
+const Debug = 1
 const CDebug = 0
 const BDebug = 0
 const ADebug = 0
