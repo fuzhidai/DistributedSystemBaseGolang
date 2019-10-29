@@ -42,7 +42,7 @@ type KVServer struct {
 	requestRecord []int64
 	lastRequest   int64
 
-	valueCh    chan string
+	valueCh    chan Value
 	valueState bool
 
 	identityCh    chan int64
@@ -53,6 +53,11 @@ type KVServer struct {
 	putAppendCh chan int
 
 	lock *int
+}
+
+type Value struct {
+	identity int64
+	value    string
 }
 
 func (kv *KVServer) initDispatch() {
@@ -130,15 +135,15 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	//defer kv.mu.Unlock()
 
 	// v1.1
-	//kv.dispatchCh <- "getStart"
-	//<- kv.getCh
-	//defer func() {kv.dispatchCh <- "getEnd"}()
+	kv.dispatchCh <- "getStart"
+	<-kv.getCh
+	defer func() { kv.dispatchCh <- "getEnd" }()
 
 	// v1.2
-	for *kv.lock == 1 {
-	}
-	*kv.lock = 1
-	defer func() { *kv.lock = 0 }()
+	//for *kv.lock == 1 {
+	//}
+	//*kv.lock = 1
+	//defer func() { *kv.lock = 0 }()
 
 	_, isLeader := kv.rf.GetState()
 	reply.WrongLeader = !isLeader
@@ -148,8 +153,12 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		reply.Err = OK
 		reply.Value = kv.getValue(args.Key)
 		DPrintf("return with reply %v", reply)
-		//kv.lastRequest = args.Identity
+		kv.lastRequest = args.Identity
 		return
+	}
+
+	if args.Identity != kv.lastRequest {
+		kv.deleteRequestRecordWithIdentity(kv.lastRequest)
 	}
 
 	if isLeader {
@@ -158,15 +167,20 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 		DPrintf("server %d start args %v", kv.me, args)
 
-		//kv.rf.Start(command)
-
-		//reply.Value = <-kv.valueCh
-
 		flag := 0
-		go func(flag *int) {
-			reply.Value = <-kv.valueCh
-			*flag = 1
-		}(&flag)
+		go func(flag *int, args *GetArgs) {
+			for value := range kv.valueCh {
+				if value.identity == args.Identity {
+					reply.Value = value.value
+					*flag = 1
+					return
+				} else if value.identity == -1 {
+					return
+				}
+			}
+
+			DPrintf("value %v args %v", reply.Value, args)
+		}(&flag, args)
 
 		kv.valueState = true
 		oldIndex, oldTerm, _ := kv.rf.Start(command)
@@ -184,24 +198,21 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 			reply.Err = "LoseLeadership"
 			reply.WrongLeader = true
 			kv.valueState = false
-			kv.valueCh <- ""
+			kv.valueCh <- Value{-1, ""}
 			DPrintf("return with reply %v", reply)
 			return
 		}
 		DPrintf("server %d get value %v", kv.me, reply.Value)
 
-		// Cope with duplicate Clerk requests.
-		kv.requestRecord = append(kv.requestRecord, args.Identity)
+		if reply.Err = OK; len(reply.Value) == 0 {
+			reply.Err = ErrNoKey
+		}
 
 		// Free server memory quickly.
 		//if args.Identity != kv.lastRequest {
 		//	kv.deleteRequestRecordWithIdentity(kv.lastRequest)
 		//}
 		//kv.lastRequest = args.Identity
-
-		if reply.Err = OK; len(reply.Value) == 0 {
-			reply.Err = ErrNoKey
-		}
 	}
 }
 
@@ -214,15 +225,15 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	//defer kv.mu.Unlock()
 
 	// v1.1
-	//kv.dispatchCh <- "putAppendStart"
-	//<- kv.putAppendCh
-	//defer func() {kv.dispatchCh <- "putAppendEnd"}()
+	kv.dispatchCh <- "putAppendStart"
+	<-kv.putAppendCh
+	defer func() { kv.dispatchCh <- "putAppendEnd" }()
 
 	//v1.2
-	for *kv.lock == 1 {
-	}
-	*kv.lock = 1
-	defer func() { *kv.lock = 0 }()
+	//for *kv.lock == 1 {
+	//}
+	//*kv.lock = 1
+	//defer func() { *kv.lock = 0 }()
 
 	_, isLeader := kv.rf.GetState()
 	reply.WrongLeader = !isLeader
@@ -230,18 +241,18 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Cope with duplicate Clerk requests.
 	if kv.findRecordContainIdentity(args.Identity, kv.requestRecord) {
 		reply.Err = OK
-		//kv.lastRequest = args.Identity
+		kv.lastRequest = args.Identity
 		return
+	}
+
+	if args.Identity != kv.lastRequest {
+		kv.deleteRequestRecordWithIdentity(kv.lastRequest)
 	}
 
 	if isLeader {
 
 		command := Op{args.Identity, args.Op, args.Key, args.Value}
 		DPrintf("server %d start args %v", kv.me, args)
-
-		//kv.rf.Start(command)
-
-		//<-kv.valueCh // block to wait to finish consistent.
 
 		flag := 0
 		go func(flag *int, args *PutAppendArgs) {
@@ -256,10 +267,8 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 			}
 		}(&flag, args)
 
-		//kv.identityCh = make(chan int64)
 		kv.identityState = true
 		oldIndex, oldTerm, _ := kv.rf.Start(command)
-		kv.requestRecord = append(kv.requestRecord, args.Identity)
 
 		DPrintf("server %d old index %d old term %d", kv.me, oldIndex, oldTerm)
 
@@ -279,19 +288,15 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 			DPrintf("return with reply %v", reply)
 			return
 		}
-
-		// Cope with duplicate Clerk requests.
-		// kv.requestRecord = append(kv.requestRecord, args.Identity)
-
-		// Free server memory quickly.
-		//if args.Identity != kv.lastRequest {
-		//	kv.deleteRequestRecordWithIdentity(kv.lastRequest)
-		//}
-		//kv.lastRequest = args.Identity
-
 		DPrintf("server %d submit command %v | isLeader %v", kv.me, command, isLeader)
 	}
 	reply.Err = OK
+
+	// Free server memory quickly.
+	//if args.Identity != kv.lastRequest {
+	//	kv.deleteRequestRecordWithIdentity(kv.lastRequest)
+	//}
+	//kv.lastRequest = args.Identity
 }
 
 func (kv *KVServer) initApplyCommand() {
@@ -302,13 +307,14 @@ func (kv *KVServer) applyCommand() {
 
 	for applyMsg := range kv.applyCh {
 		command, _ := applyMsg.Command.(Op)
-		//DPrintf("server %d begin apply command %v", kv.me, command)
+		// Cope with duplicate Clerk requests.
+		kv.requestRecord = append(kv.requestRecord, command.Identity)
 
 		switch command.Operation {
 		case "Get":
 			DPrintf("server %d put command %v.", kv.me, command)
 			if _, isLeader := kv.rf.GetState(); isLeader && kv.valueState {
-				kv.valueCh <- kv.getValue(command.Key)
+				kv.valueCh <- Value{command.Identity, kv.getValue(command.Key)}
 			}
 			//DPrintf("server %d over get.", kv.me)
 
@@ -420,12 +426,12 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.log = make(map[string]string)
-	kv.valueCh = make(chan string)
+	kv.valueCh = make(chan Value)
 	kv.identityCh = make(chan int64)
-	//kv.initDispatch()
+	kv.initDispatch()
 
-	lockVal := 0
-	kv.lock = &lockVal // 0 is unlock | 1 is lock.
+	//lockVal := 0
+	//kv.lock = &lockVal // 0 is unlock | 1 is lock.
 
 	kv.initApplyCommand()
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
