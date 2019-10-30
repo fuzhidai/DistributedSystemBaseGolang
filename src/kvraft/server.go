@@ -1,6 +1,9 @@
 package raftkv
 
 import (
+	"bytes"
+	"encoding/gob"
+	"fmt"
 	"labgob"
 	"labrpc"
 	"log"
@@ -52,6 +55,9 @@ type KVServer struct {
 	getCh       chan int
 	putAppendCh chan int
 
+	internalSnapshotCh chan raft.Snapshot // snapshot
+	snapshotCh         chan raft.Snapshot // snapshot
+
 	lock *int
 }
 
@@ -65,10 +71,10 @@ func (kv *KVServer) initDispatch() {
 	kv.dispatchCh = make(chan string)
 	kv.getCh = make(chan int)
 	kv.putAppendCh = make(chan int)
-	go kv.dispatch()
+	go kv.doDispatch()
 }
 
-func (kv *KVServer) dispatch() {
+func (kv *KVServer) doDispatch() {
 
 	var queue []string
 	lock := false
@@ -300,10 +306,10 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 }
 
 func (kv *KVServer) initApplyCommand() {
-	go kv.applyCommand()
+	go kv.doApplyCommand()
 }
 
-func (kv *KVServer) applyCommand() {
+func (kv *KVServer) doApplyCommand() {
 
 	for applyMsg := range kv.applyCh {
 		command, _ := applyMsg.Command.(Op)
@@ -336,6 +342,11 @@ func (kv *KVServer) applyCommand() {
 
 		default:
 			// do nothing.
+		}
+
+		// should do after apply command.
+		if kv.maxraftstate != -1 {
+			kv.internalSnapshotCh <- applyMsg.Snapshot // snapshot
 		}
 	}
 }
@@ -388,6 +399,93 @@ func (kv *KVServer) appendValue(key string, value string) {
 	kv.putValue(key, value)
 }
 
+/**
+Snapshot
+*/
+func (kv *KVServer) initSnapshot(persister *raft.Persister) {
+	if kv.maxraftstate != -1 {
+		kv.internalSnapshotCh = make(chan raft.Snapshot)
+		go kv.doSnapshot(persister)
+	}
+}
+
+func (kv *KVServer) doSnapshot(persister *raft.Persister) {
+
+	for snapshot := range kv.internalSnapshotCh {
+		if persister.RaftStateSize() >= kv.maxraftstate {
+			snapshot.StateMachineState = kv.log
+			kv.snapshotCh <- snapshot
+		}
+	}
+}
+
+func (kv *KVServer) restoreFromSnapshot(snapshotBytes []byte) {
+
+	buf := bytes.NewBuffer(snapshotBytes)
+	decoder := labgob.NewDecoder(buf)
+	var tmpLog map[string]string
+	_ = decoder.Decode(&tmpLog)
+	kv.log = tmpLog
+}
+
+func (kv *KVServer) doSerializeLog(logData map[string]string) []byte {
+
+	//v1.0
+	//for key, val := range log {
+	//
+	//	keyLen := strconv.Itoa(len(key)) + " "
+	//	valLen := strconv.Itoa(len(val)) + " "
+	//	curSnapshot := keyLen + valLen + key + val
+	//
+	//	snapshot = append(snapshot, []byte(curSnapshot)...)
+	//}
+
+	//v1.1 GOB-encode
+	var buffer bytes.Buffer
+	encoder := gob.NewEncoder(&buffer)
+	if err := encoder.Encode(&logData); err != nil {
+		log.Panic(err)
+	}
+	fmt.Printf("序列化后：%x\n")
+	snapshot := buffer.Bytes()
+
+	return snapshot
+}
+
+func (kv *KVServer) doDeserializeLog(snapshot []byte) map[string]string {
+
+	// v1.0
+	//tmpLog := string(snapshot)
+	//resLog   := make(map[string]string)
+	//fmt.Println(tmpLog)
+	//
+	//for index := 0; len(tmpLog) > 0; {
+	//
+	//	index = strings.Index(tmpLog, " ")
+	//	keyLen, _ := strconv.Atoi(tmpLog[:index])
+	//	tmpLog = tmpLog[index+1:]
+	//
+	//	index = strings.Index(tmpLog, " ")
+	//	valLen, _ := strconv.Atoi(tmpLog[:index])
+	//	tmpLog = tmpLog[index+1:]
+	//
+	//	key := tmpLog[:keyLen]
+	//	val := tmpLog[keyLen:keyLen+valLen]
+	//	tmpLog = tmpLog[keyLen+valLen:]
+	//	resLog[key] = val
+	//}
+
+	//v1.1 GOB-decode
+	var buffer bytes.Buffer
+	byteEn := buffer.Bytes()
+	decoder := gob.NewDecoder(bytes.NewReader(byteEn))
+	var logData map[string]string
+	if err := decoder.Decode(&logData); err != nil {
+		log.Panic(err)
+	}
+	return logData
+}
+
 //
 // the tester calls Kill() when a KVServer instance won't
 // be needed again. you are not required to do anything
@@ -429,6 +527,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.valueCh = make(chan Value)
 	kv.identityCh = make(chan int64)
 	kv.initDispatch()
+	kv.initSnapshot(persister)
 
 	//lockVal := 0
 	//kv.lock = &lockVal // 0 is unlock | 1 is lock.
@@ -437,6 +536,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	kv.rf.SetAndInitSnapshotCh(kv.snapshotCh) // snapshot
+	kv.restoreFromSnapshot(persister.ReadSnapshot())
 
 	return kv
 }
