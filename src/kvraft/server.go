@@ -163,9 +163,9 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 
-	if args.Identity != kv.lastRequest {
-		kv.deleteRequestRecordWithIdentity(kv.lastRequest)
-	}
+	//if args.Identity != kv.lastRequest {
+	//	kv.deleteRequestRecordWithIdentity(kv.lastRequest)
+	//}
 
 	if isLeader {
 
@@ -190,12 +190,14 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 		kv.valueState = true
 		oldIndex, oldTerm, _ := kv.rf.Start(command)
+		time.Sleep(time.Duration(20) * time.Millisecond)
+
 		DPrintf("server %d old index %d old term %d", kv.me, oldIndex, oldTerm)
 
 		for index, term := oldIndex, oldTerm; flag == 0 && oldIndex == index && oldTerm == term; {
 			// request to fast will make repeat invoke.
-			time.Sleep(time.Duration(20) * time.Millisecond)
 			index, term, _ = kv.rf.Start(command)
+			time.Sleep(time.Duration(20) * time.Millisecond)
 			DPrintf("server %d current index %d current term %d flag %d", kv.me, index, term, flag)
 		}
 
@@ -251,9 +253,9 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 
-	if args.Identity != kv.lastRequest {
-		kv.deleteRequestRecordWithIdentity(kv.lastRequest)
-	}
+	//if args.Identity != kv.lastRequest {
+	//	kv.deleteRequestRecordWithIdentity(kv.lastRequest)
+	//}
 
 	if isLeader {
 
@@ -275,13 +277,14 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 		kv.identityState = true
 		oldIndex, oldTerm, _ := kv.rf.Start(command)
+		time.Sleep(time.Duration(20) * time.Millisecond)
 
 		DPrintf("server %d old index %d old term %d", kv.me, oldIndex, oldTerm)
 
 		for index, term := oldIndex, oldTerm; flag == 0 && oldIndex == index && oldTerm == term; {
 			// request to fast will make repeat invoke.
-			time.Sleep(time.Duration(20) * time.Millisecond)
 			index, term, _ = kv.rf.Start(command)
+			time.Sleep(time.Duration(20) * time.Millisecond)
 			DPrintf("server %d current index %d current term %d flag %d", kv.me, index, term, flag)
 		}
 
@@ -312,41 +315,56 @@ func (kv *KVServer) initApplyCommand() {
 func (kv *KVServer) doApplyCommand() {
 
 	for applyMsg := range kv.applyCh {
-		command, _ := applyMsg.Command.(Op)
-		// Cope with duplicate Clerk requests.
-		kv.requestRecord = append(kv.requestRecord, command.Identity)
 
-		switch command.Operation {
-		case "Get":
-			DPrintf("server %d put command %v.", kv.me, command)
-			if _, isLeader := kv.rf.GetState(); isLeader && kv.valueState {
-				kv.valueCh <- Value{command.Identity, kv.getValue(command.Key)}
+		DPrintf("server %d get applyMsg %v", kv.me, applyMsg)
+
+		if applyMsg.CommandValid {
+
+			command, _ := applyMsg.Command.(Op)
+			// Cope with duplicate Clerk requests.
+			kv.requestRecord = append(kv.requestRecord, command.Identity)
+
+			switch command.Operation {
+			case "Get":
+				DPrintf("server %d get command %v.", kv.me, command)
+				if _, isLeader := kv.rf.GetState(); isLeader && kv.valueState {
+					DPrintf("server %d doing get.", kv.me)
+					kv.valueCh <- Value{command.Identity, kv.getValue(command.Key)}
+				}
+				DPrintf("server %d over get.", kv.me)
+
+			case "Put":
+				DPrintf("server %d put command %v.", kv.me, command)
+				kv.putValue(command.Key, command.Value)
+				if _, isLeader := kv.rf.GetState(); isLeader && kv.identityState {
+					DPrintf("server %d doing put.", kv.me)
+					kv.identityCh <- command.Identity
+				}
+				DPrintf("server %d over put.", kv.me)
+
+			case "Append":
+				DPrintf("server %d append command %v. ", kv.me, command)
+				kv.appendValue(command.Key, command.Value)
+				if _, isLeader := kv.rf.GetState(); isLeader && kv.identityState {
+					DPrintf("server %d doing append.", kv.me)
+					kv.identityCh <- command.Identity
+				}
+				DPrintf("server %d over append.", kv.me)
+
+			default:
+				// do nothing.
 			}
-			//DPrintf("server %d over get.", kv.me)
 
-		case "Put":
-			DPrintf("server %d put command %v.", kv.me, command)
-			kv.putValue(command.Key, command.Value)
-			if _, isLeader := kv.rf.GetState(); isLeader && kv.identityState {
-				kv.identityCh <- command.Identity
+			// should do after apply command.
+			DPrintf("server %d send snapshot msg %v A", kv.me, applyMsg.Snapshot)
+			if kv.maxraftstate != -1 {
+				DPrintf("server %d send snapshot msg %v B", kv.me, applyMsg.Snapshot)
+				kv.internalSnapshotCh <- applyMsg.Snapshot // snapshot
 			}
-			//DPrintf("server %d over put.", kv.me)
-
-		case "Append":
-			DPrintf("server %d append command %v.", kv.me, command)
-			kv.appendValue(command.Key, command.Value)
-			if _, isLeader := kv.rf.GetState(); isLeader && kv.identityState {
-				kv.identityCh <- command.Identity
-			}
-			//DPrintf("server %d over append.", kv.me)
-
-		default:
-			// do nothing.
-		}
-
-		// should do after apply command.
-		if kv.maxraftstate != -1 {
-			kv.internalSnapshotCh <- applyMsg.Snapshot // snapshot
+		} else {
+			// do snapshot
+			DPrintf("Restore from Raft %v", applyMsg)
+			kv.log = applyMsg.Snapshot.StateMachineState
 		}
 	}
 }
@@ -405,6 +423,7 @@ Snapshot
 func (kv *KVServer) initSnapshot(persister *raft.Persister) {
 	if kv.maxraftstate != -1 {
 		kv.internalSnapshotCh = make(chan raft.Snapshot)
+		kv.snapshotCh = make(chan raft.Snapshot)
 		go kv.doSnapshot(persister)
 	}
 }
@@ -413,6 +432,7 @@ func (kv *KVServer) doSnapshot(persister *raft.Persister) {
 
 	for snapshot := range kv.internalSnapshotCh {
 		if persister.RaftStateSize() >= kv.maxraftstate {
+			DPrintf("server %d do Snapshot when size %d | log %v", kv.me, persister.RaftStateSize(), kv.log)
 			snapshot.StateMachineState = kv.log
 			kv.snapshotCh <- snapshot
 		}
@@ -423,9 +443,14 @@ func (kv *KVServer) restoreFromSnapshot(snapshotBytes []byte) {
 
 	buf := bytes.NewBuffer(snapshotBytes)
 	decoder := labgob.NewDecoder(buf)
-	var tmpLog map[string]string
-	_ = decoder.Decode(&tmpLog)
-	kv.log = tmpLog
+	var snapshot raft.Snapshot
+	_ = decoder.Decode(&snapshot)
+	if snapshot.StateMachineState == nil {
+		kv.log = make(map[string]string)
+	} else {
+		kv.log = snapshot.StateMachineState
+	}
+	DPrintf("Restore from Snapshot with %v", snapshot)
 }
 
 func (kv *KVServer) doSerializeLog(logData map[string]string) []byte {
@@ -521,6 +546,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 
 	// You may need initialization code here.
+
+	//kv.maxraftstate = 1 // test snapshot.
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.log = make(map[string]string)
