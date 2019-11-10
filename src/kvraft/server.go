@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const Debug = 1
+const Debug = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -38,18 +38,18 @@ type KVServer struct {
 	rf      *raft.Raft
 	applyCh chan raft.ApplyMsg
 
-	maxraftstate int // snapshot if log grows this big
+	maxraftstate int             // snapshot if log grows this big
+	persister    *raft.Persister // Object to hold this peer's persisted state
 
 	// Your definitions here.
 	log           map[string]string
 	requestRecord []int64
 	lastRequest   int64
+	curRequest    int64
 
-	valueCh    chan Value
-	valueState bool
+	valueCh chan Value
 
-	identityCh    chan int64
-	identityState bool
+	identityCh chan int64
 
 	dispatchCh  chan string
 	getCh       chan int
@@ -135,21 +135,10 @@ func (kv *KVServer) doDispatch() {
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 
-	// v1.0
-	// use lock to guarantee invoking linearly.
-	//kv.mu.Lock()
-	//defer kv.mu.Unlock()
-
 	// v1.1
 	kv.dispatchCh <- "getStart"
 	<-kv.getCh
 	defer func() { kv.dispatchCh <- "getEnd" }()
-
-	// v1.2
-	//for *kv.lock == 1 {
-	//}
-	//*kv.lock = 1
-	//defer func() { *kv.lock = 0 }()
 
 	_, isLeader := kv.rf.GetState()
 	reply.WrongLeader = !isLeader
@@ -158,90 +147,58 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	if kv.findRecordContainIdentity(args.Identity, kv.requestRecord) {
 		reply.Err = OK
 		reply.Value = kv.getValue(args.Key)
-		DPrintf("return with reply %v", reply)
-		kv.lastRequest = args.Identity
 		return
 	}
-
-	//if args.Identity != kv.lastRequest {
-	//	kv.deleteRequestRecordWithIdentity(kv.lastRequest)
-	//}
 
 	if isLeader {
 
 		command := Op{args.Identity, "Get", args.Key, ""}
-
-		DPrintf("server %d start args %v", kv.me, args)
+		kv.curRequest = args.Identity
 
 		flag := 0
-		go func(flag *int, args *GetArgs) {
-			for value := range kv.valueCh {
-				if value.identity == args.Identity {
-					reply.Value = value.value
-					*flag = 1
-					return
-				} else if value.identity == -1 {
-					return
-				}
+		closeCh := make(chan interface{})
+
+		go func(flag *int) {
+			select {
+			case value := <-kv.valueCh:
+				reply.Value = value.value
+				*flag = 1
+				return
+			case <-closeCh:
+				return
 			}
+		}(&flag)
 
-			DPrintf("value %v args %v", reply.Value, args)
-		}(&flag, args)
-
-		kv.valueState = true
 		oldIndex, oldTerm, _ := kv.rf.Start(command)
 		time.Sleep(time.Duration(20) * time.Millisecond)
-
-		DPrintf("server %d old index %d old term %d", kv.me, oldIndex, oldTerm)
 
 		for index, term := oldIndex, oldTerm; flag == 0 && oldIndex == index && oldTerm == term; {
 			// request to fast will make repeat invoke.
 			index, term, _ = kv.rf.Start(command)
 			time.Sleep(time.Duration(20) * time.Millisecond)
-			DPrintf("server %d current index %d current term %d flag %d", kv.me, index, term, flag)
 		}
 
 		// Leader loses its leadership before the request is committed to the log.
 		if flag == 0 {
 			reply.Err = "LoseLeadership"
 			reply.WrongLeader = true
-			kv.valueState = false
-			kv.valueCh <- Value{-1, ""}
-			DPrintf("return with reply %v", reply)
+			close(closeCh) // quit goroutine.
 			return
 		}
-		DPrintf("server %d get value %v", kv.me, reply.Value)
 
 		if reply.Err = OK; len(reply.Value) == 0 {
 			reply.Err = ErrNoKey
 		}
-
-		// Free server memory quickly.
-		//if args.Identity != kv.lastRequest {
-		//	kv.deleteRequestRecordWithIdentity(kv.lastRequest)
-		//}
-		//kv.lastRequest = args.Identity
 	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 
-	// v1.0
-	// use lock to guarantee invoking linearly.
-	//kv.mu.Lock()
-	//defer kv.mu.Unlock()
-
 	// v1.1
 	kv.dispatchCh <- "putAppendStart"
 	<-kv.putAppendCh
 	defer func() { kv.dispatchCh <- "putAppendEnd" }()
-
-	//v1.2
-	//for *kv.lock == 1 {
-	//}
-	//*kv.lock = 1
-	//defer func() { *kv.lock = 0 }()
 
 	_, isLeader := kv.rf.GetState()
 	reply.WrongLeader = !isLeader
@@ -249,63 +206,46 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Cope with duplicate Clerk requests.
 	if kv.findRecordContainIdentity(args.Identity, kv.requestRecord) {
 		reply.Err = OK
-		kv.lastRequest = args.Identity
 		return
 	}
-
-	//if args.Identity != kv.lastRequest {
-	//	kv.deleteRequestRecordWithIdentity(kv.lastRequest)
-	//}
 
 	if isLeader {
 
 		command := Op{args.Identity, args.Op, args.Key, args.Value}
-		DPrintf("server %d start args %v", kv.me, args)
+		kv.curRequest = args.Identity
 
 		flag := 0
-		go func(flag *int, args *PutAppendArgs) {
-			for identity := range kv.identityCh {
-				DPrintf("identity %d args %v", identity, args)
-				if identity == args.Identity {
-					*flag = 1
-					return
-				} else if identity == -1 {
-					return
-				}
-			}
-		}(&flag, args)
+		closeCh := make(chan interface{})
 
-		kv.identityState = true
+		go func(flag *int) {
+
+			select {
+			case <-kv.identityCh:
+				*flag = 1
+				return
+			case <-closeCh:
+				return
+			}
+		}(&flag)
+
 		oldIndex, oldTerm, _ := kv.rf.Start(command)
 		time.Sleep(time.Duration(20) * time.Millisecond)
-
-		DPrintf("server %d old index %d old term %d", kv.me, oldIndex, oldTerm)
 
 		for index, term := oldIndex, oldTerm; flag == 0 && oldIndex == index && oldTerm == term; {
 			// request to fast will make repeat invoke.
 			index, term, _ = kv.rf.Start(command)
 			time.Sleep(time.Duration(20) * time.Millisecond)
-			DPrintf("server %d current index %d current term %d flag %d", kv.me, index, term, flag)
 		}
 
 		// Leader loses its leadership before the request is committed to the log.
 		if flag == 0 {
 			reply.Err = "LoseLeadership"
 			reply.WrongLeader = true
-			kv.identityCh <- -1
-			kv.identityState = false
-			DPrintf("return with reply %v", reply)
+			close(closeCh) // quit goroutine.
 			return
 		}
-		DPrintf("server %d submit command %v | isLeader %v", kv.me, command, isLeader)
 	}
 	reply.Err = OK
-
-	// Free server memory quickly.
-	//if args.Identity != kv.lastRequest {
-	//	kv.deleteRequestRecordWithIdentity(kv.lastRequest)
-	//}
-	//kv.lastRequest = args.Identity
 }
 
 func (kv *KVServer) initApplyCommand() {
@@ -316,56 +256,53 @@ func (kv *KVServer) doApplyCommand() {
 
 	for applyMsg := range kv.applyCh {
 
-		DPrintf("server %d get applyMsg %v", kv.me, applyMsg)
-
 		if applyMsg.CommandValid {
 
 			command, _ := applyMsg.Command.(Op)
+
+			if kv.findRecordContainIdentity(command.Identity, kv.requestRecord) {
+				continue
+			}
+
 			// Cope with duplicate Clerk requests.
 			kv.requestRecord = append(kv.requestRecord, command.Identity)
 
 			switch command.Operation {
 			case "Get":
-				DPrintf("server %d get command %v.", kv.me, command)
-				if _, isLeader := kv.rf.GetState(); isLeader && kv.valueState {
-					DPrintf("server %d doing get.", kv.me)
+				if command.Identity == kv.curRequest {
 					kv.valueCh <- Value{command.Identity, kv.getValue(command.Key)}
 				}
-				DPrintf("server %d over get.", kv.me)
 
 			case "Put":
-				DPrintf("server %d put command %v.", kv.me, command)
 				kv.putValue(command.Key, command.Value)
-				if _, isLeader := kv.rf.GetState(); isLeader && kv.identityState {
-					DPrintf("server %d doing put.", kv.me)
+				if command.Identity == kv.curRequest {
 					kv.identityCh <- command.Identity
 				}
-				DPrintf("server %d over put.", kv.me)
 
 			case "Append":
-				DPrintf("server %d append command %v. ", kv.me, command)
 				kv.appendValue(command.Key, command.Value)
-				if _, isLeader := kv.rf.GetState(); isLeader && kv.identityState {
-					DPrintf("server %d doing append.", kv.me)
+				if command.Identity == kv.curRequest {
 					kv.identityCh <- command.Identity
 				}
-				DPrintf("server %d over append.", kv.me)
 
 			default:
 				// do nothing.
 			}
 
 			// should do after apply command.
-			DPrintf("server %d send snapshot msg %v A", kv.me, applyMsg.Snapshot)
-			if kv.maxraftstate != -1 {
-				DPrintf("server %d send snapshot msg %v B", kv.me, applyMsg.Snapshot)
+			if kv.maxraftstate != -1 && kv.persister.RaftStateSize() >= kv.maxraftstate*9/10 {
 				kv.internalSnapshotCh <- applyMsg.Snapshot // snapshot
 			}
 		} else {
 			// do snapshot
-			DPrintf("Restore from Raft %v", applyMsg)
 			kv.log = applyMsg.Snapshot.StateMachineState
 		}
+	}
+}
+
+func (kv *KVServer) doDeleteUnusedDuplicateRequests() {
+	if kv.lastRequest != kv.curRequest {
+		kv.deleteRequestRecordWithIdentity(kv.lastRequest)
 	}
 }
 
@@ -431,11 +368,11 @@ func (kv *KVServer) initSnapshot(persister *raft.Persister) {
 func (kv *KVServer) doSnapshot(persister *raft.Persister) {
 
 	for snapshot := range kv.internalSnapshotCh {
-		if persister.RaftStateSize() >= kv.maxraftstate {
-			DPrintf("server %d do Snapshot when size %d | log %v", kv.me, persister.RaftStateSize(), kv.log)
-			snapshot.StateMachineState = kv.log
-			kv.snapshotCh <- snapshot
-		}
+		//if persister.RaftStateSize() >= kv.maxraftstate {
+		snapshot.StateMachineState = kv.log
+		snapshot.RequestRecord = kv.requestRecord
+		go func() { kv.snapshotCh <- snapshot }()
+		//}
 	}
 }
 
@@ -449,21 +386,11 @@ func (kv *KVServer) restoreFromSnapshot(snapshotBytes []byte) {
 		kv.log = make(map[string]string)
 	} else {
 		kv.log = snapshot.StateMachineState
+		kv.requestRecord = snapshot.RequestRecord
 	}
-	DPrintf("Restore from Snapshot with %v", snapshot)
 }
 
 func (kv *KVServer) doSerializeLog(logData map[string]string) []byte {
-
-	//v1.0
-	//for key, val := range log {
-	//
-	//	keyLen := strconv.Itoa(len(key)) + " "
-	//	valLen := strconv.Itoa(len(val)) + " "
-	//	curSnapshot := keyLen + valLen + key + val
-	//
-	//	snapshot = append(snapshot, []byte(curSnapshot)...)
-	//}
 
 	//v1.1 GOB-encode
 	var buffer bytes.Buffer
@@ -478,27 +405,6 @@ func (kv *KVServer) doSerializeLog(logData map[string]string) []byte {
 }
 
 func (kv *KVServer) doDeserializeLog(snapshot []byte) map[string]string {
-
-	// v1.0
-	//tmpLog := string(snapshot)
-	//resLog   := make(map[string]string)
-	//fmt.Println(tmpLog)
-	//
-	//for index := 0; len(tmpLog) > 0; {
-	//
-	//	index = strings.Index(tmpLog, " ")
-	//	keyLen, _ := strconv.Atoi(tmpLog[:index])
-	//	tmpLog = tmpLog[index+1:]
-	//
-	//	index = strings.Index(tmpLog, " ")
-	//	valLen, _ := strconv.Atoi(tmpLog[:index])
-	//	tmpLog = tmpLog[index+1:]
-	//
-	//	key := tmpLog[:keyLen]
-	//	val := tmpLog[keyLen:keyLen+valLen]
-	//	tmpLog = tmpLog[keyLen+valLen:]
-	//	resLog[key] = val
-	//}
 
 	//v1.1 GOB-decode
 	var buffer bytes.Buffer
@@ -548,7 +454,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 
 	//kv.maxraftstate = 1 // test snapshot.
-
+	kv.persister = persister
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.log = make(map[string]string)
 	kv.valueCh = make(chan Value)

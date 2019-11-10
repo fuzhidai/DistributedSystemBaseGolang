@@ -55,6 +55,7 @@ type Snapshot struct {
 	LastIncludeIndex  int
 	LastIncludeTerm   int
 	StateMachineState map[string]string
+	RequestRecord     []int64 // detect duplicated operations
 }
 
 //
@@ -611,10 +612,11 @@ func (rf *Raft) startVote() {
 				reply := &RequestVoteReply{}
 				rf.mu.Unlock()
 
-				//DPrintf("Send vote to peer %d.", server)
+				NPrintf("Send vote to peer %d.", server)
 
 				// send request vote
 				if rf.sendRequestVote(server, args, reply) {
+					NPrintf("Get vote to peer %d.", server)
 
 					if reply.VoteGranted {
 						// send message to collect func.
@@ -638,6 +640,7 @@ func (rf *Raft) startVote() {
 
 				} else {
 					// mean have something wrong with RPC
+					NPrintf("something wrong with net.")
 				}
 			}(server)
 		}
@@ -820,7 +823,7 @@ func (rf *Raft) updateLastApplyIndex() {
 	for {
 		if rf.commitIndex > rf.lastApplied {
 			rf.lastApplied++
-			snapshot := Snapshot{rf.lastApplied, rf.getTermByLogIndex(rf.lastApplied), nil} // Snapshot
+			snapshot := Snapshot{rf.lastApplied, rf.getTermByLogIndex(rf.lastApplied), nil, nil} // Snapshot
 			NPrintf("peer %d TEST A. snapshot %v", rf.me, snapshot)
 			rf.applyCh <- ApplyMsg{true, rf.getLogByLogIndex(rf.lastApplied).Command, rf.lastApplied, snapshot}
 			NPrintf("peer %d TEST B.", rf.me)
@@ -915,12 +918,13 @@ func (rf *Raft) initConsistentLoop() {
 
 				for {
 
-					time.Sleep(HeartbeatTimeout / 50)
+					time.Sleep(HeartbeatTimeout / 10)
 
 					rf.mu.Lock()
-					if rf.loopSwitch && (rf.matchIndex[server] < rf.matchIndex[rf.me] || rf.nextIndex[server] < rf.nextIndex[rf.me]) {
-						rf.mu.Unlock()
+					doConsistent := rf.loopSwitch && (rf.matchIndex[server] < rf.matchIndex[rf.me] || rf.nextIndex[server] < rf.nextIndex[rf.me])
+					rf.mu.Unlock()
 
+					if doConsistent {
 						rf.mu.Lock()
 						prevLogIndex := rf.nextIndex[server] - 1
 						prevLogTerm := rf.getTermByLogIndex(prevLogIndex)
@@ -929,7 +933,7 @@ func (rf *Raft) initConsistentLoop() {
 
 						//logs := rf.log[rf.nextIndex[server], rf.nextIndex[rf.me]]
 						startIndex, endIndex := rf.getIndexByLogIndex(rf.nextIndex[server]-1), rf.getIndexByLogIndex(rf.nextIndex[rf.me]-1)
-						NPrintf("server %d me %d log %v", rf.nextIndex[server], rf.nextIndex[rf.me], rf.log[1:])
+						NPrintf("Leader %d server %d me %d log %v", rf.me, rf.nextIndex[server], rf.nextIndex[rf.me], rf.log)
 
 						// send snapshot
 						//lastLog := rf.log[len(rf.log)-1]
@@ -948,6 +952,9 @@ func (rf *Raft) initConsistentLoop() {
 							args := &InstallSnapshotArgs{rf.currentTerm, strconv.Itoa(rf.me), localSnapshot.LastIncludeIndex,
 								localSnapshot.LastIncludeTerm, -1, snapshotBytes, -1}
 							reply := &InstallSnapshotReply{}
+
+							// think installSnapPRC as a heartbeat.
+							rf.startHeartbeatTimer()
 							rf.mu.Unlock()
 
 							if rf.sendInstallSnapshot(server, args, reply) {
@@ -989,7 +996,7 @@ func (rf *Raft) initConsistentLoop() {
 									rf.matchIndex[server] = index - 1
 									rf.updateCommitIndex()
 									rf.updateLastApplyIndex()
-									go rf.sendCommitMsg(server)
+									//go rf.sendCommitMsg(server)
 
 								}
 								rf.mu.Unlock()
@@ -1022,8 +1029,6 @@ func (rf *Raft) initConsistentLoop() {
 						} else {
 							// network fail return directly.
 						}
-					} else {
-						rf.mu.Unlock()
 					}
 				}
 			}(server)
@@ -1064,11 +1069,10 @@ func (rf *Raft) doSnapshot() {
 		encoder := labgob.NewEncoder(buf)
 		_ = encoder.Encode(snapshot)
 		snapshotBytes := buf.Bytes()
-		rf.persister.SaveStateAndSnapshot(rf.persister.ReadRaftState(), snapshotBytes)
-
-		sliceIndex := rf.getIndexByLogIndex(snapshot.LastIncludeIndex)
 
 		rf.mu.Lock()
+		rf.persister.SaveStateAndSnapshot(rf.persister.ReadRaftState(), snapshotBytes)
+		sliceIndex := rf.getIndexByLogIndex(snapshot.LastIncludeIndex)
 		NPrintf("peer %d do snapshot Before log is %v snapshot %v", rf.me, rf.log, snapshot)
 		rf.log = append([]Log{{snapshot.LastIncludeIndex, snapshot.LastIncludeTerm, nil}}, rf.log[sliceIndex+1:]...)
 		NPrintf("peer %d do snapshot After log is %v local Snapshot %v", rf.me, rf.log, rf.getSnapshotFromPersist())
