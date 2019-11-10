@@ -10,6 +10,7 @@ import "math/big"
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	lastReply int64
 }
 
 func nrand() int64 {
@@ -47,7 +48,7 @@ func (ck *Clerk) Get(key string) string {
 		for server := range ck.servers {
 
 			// You will have to modify this function.
-			args := &GetArgs{key, identity}
+			args := &GetArgs{key, identity, ck.lastReply}
 			reply := &GetReply{}
 
 			ok := ck.sendGet(server, args, reply)
@@ -61,6 +62,7 @@ func (ck *Clerk) Get(key string) string {
 			// send PRC to Leader successfully. Return fetch value.
 			if !reply.WrongLeader && reply.Err == OK {
 				DPrintf("Get args %v return", args)
+				ck.lastReply = identity
 				switch reply.Err {
 				case OK:
 					return reply.Value
@@ -95,7 +97,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	for {
 		time.Sleep(time.Duration(5) * time.Millisecond)
 		for server := range ck.servers {
-			args := &PutAppendArgs{key, value, op, identity}
+			args := &PutAppendArgs{key, value, op, identity, ck.lastReply}
 			reply := &PutAppendReply{}
 
 			ok := ck.sendPutAppend(server, args, reply)
@@ -109,6 +111,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			// send PRC to Leader successfully. Return fetch value.
 			if !reply.WrongLeader && reply.Err == OK {
 				DPrintf("server %d PutAppend args %v return", server, args)
+				ck.lastReply = identity
 				return
 			}
 		}

@@ -152,6 +152,9 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 	if isLeader {
 
+		// delete unused record.
+		kv.deleteRequestRecordWithIdentity(args.LastReply)
+
 		command := Op{args.Identity, "Get", args.Key, ""}
 		kv.curRequest = args.Identity
 
@@ -210,6 +213,9 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 
 	if isLeader {
+
+		// delete unused record.
+		kv.deleteRequestRecordWithIdentity(args.LastReply)
 
 		command := Op{args.Identity, args.Op, args.Key, args.Value}
 		kv.curRequest = args.Identity
