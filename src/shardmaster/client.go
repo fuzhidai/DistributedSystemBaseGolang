@@ -31,6 +31,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Query(num int) Config {
 	args := &QueryArgs{}
 	// Your code here.
+	args.Identity = nrand()
 	args.Num = num
 	for {
 		// try each known server.
@@ -48,6 +49,7 @@ func (ck *Clerk) Query(num int) Config {
 func (ck *Clerk) Join(servers map[int][]string) {
 	args := &JoinArgs{}
 	// Your code here.
+	args.Identity = nrand()
 	args.Servers = servers
 
 	for {
@@ -66,6 +68,7 @@ func (ck *Clerk) Join(servers map[int][]string) {
 func (ck *Clerk) Leave(gids []int) {
 	args := &LeaveArgs{}
 	// Your code here.
+	args.Identity = nrand()
 	args.GIDs = gids
 
 	for {
@@ -84,6 +87,7 @@ func (ck *Clerk) Leave(gids []int) {
 func (ck *Clerk) Move(shard int, gid int) {
 	args := &MoveArgs{}
 	// Your code here.
+	args.Identity = nrand()
 	args.Shard = shard
 	args.GID = gid
 
