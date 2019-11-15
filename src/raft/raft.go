@@ -22,6 +22,7 @@ import (
 	"labgob"
 	"math"
 	"math/rand"
+	"reflect"
 	"sort"
 	"src/github.com/sasha-s/go-deadlock"
 	"strconv"
@@ -1131,9 +1132,16 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if rf.state == Leader {
 		//NPrintf("Send Command. B")
 
+		immutable := reflect.ValueOf(command)
+		commandIdentity := immutable.FieldByIndex([]int{0}).Int()
+
 		log := rf.log
 		for _, l := range log {
-			if l.Command == command {
+
+			immutable = reflect.ValueOf(l)
+			identity := immutable.FieldByIndex([]int{0}).Int()
+
+			if identity == commandIdentity {
 				index = l.LogIndex
 				break
 			}

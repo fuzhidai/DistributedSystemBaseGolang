@@ -24,7 +24,7 @@ type HashRing struct {
 func (hr *HashRing) addNode(masterNode string) {
 
 	for i := 0; i < hr.replicateCount; i++ {
-		key := hr.hashKey(masterNode + strconv.Itoa(i) + strconv.Itoa(i))
+		key := hr.hashKey(strconv.Itoa(i) + masterNode)
 		hr.nodes[key] = masterNode
 		hr.sortedNodes = append(hr.sortedNodes, key)
 	}
@@ -44,8 +44,8 @@ func (hr *HashRing) addNodes(masterNodes []string) {
 
 func (hr *HashRing) removeNode(masterNode string) {
 
-	for i := 0; i < hr.replicateCount; {
-		key := hr.hashKey(masterNode + strconv.Itoa(i) + strconv.Itoa(i))
+	for i := 0; i < hr.replicateCount; i++ {
+		key := hr.hashKey(strconv.Itoa(i) + masterNode)
 		delete(hr.nodes, key)
 
 		if success, index := hr.getIndexForKey(key); success {
