@@ -10,7 +10,7 @@ import "labrpc"
 import "sync"
 import "labgob"
 
-const Debug = 1
+const Debug = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -28,18 +28,17 @@ type ShardMaster struct {
 	// Your data here.
 	hr *HashRing
 
-	curRequest    int64
-	lastRequest   int64
-	requestRecord []int64
+	curRequest    int64   // the identity of current request which is processing.
+	requestRecord []int64 // slice of identity which client has got the request of this identity.
 
-	appendCh chan int64
-	configCh chan Config
+	appendCh chan int64  // Notify the Append method when it receives an ApplyMsg of type Append.
+	configCh chan Config // Notify the Query method when it receives an ApplyMsg of type Query and pass config to Query method.
 
-	dispatchCh chan string
-	joinCh     chan int
-	leaveCh    chan int
-	moveCh     chan int
-	queryCh    chan int
+	dispatchCh chan string // channel to lock Func so that Func can execute linearly.
+	joinCh     chan int    // channel for Join unlock Func.
+	leaveCh    chan int    // channel for Leave unlock Func.
+	moveCh     chan int    // channel for move unlock Func.
+	queryCh    chan int    // channel for query unlock Func.
 
 	configs []Config // indexed by config num
 }
@@ -47,7 +46,7 @@ type ShardMaster struct {
 type Op struct {
 	// Your data here.
 	Identity  int64
-	Operation string // Join | Leave | Move | Query
+	Operation string // Join | Leave | Move -> Append & Query -> Query
 	ConfigNum int
 	Config    Config
 }
@@ -142,42 +141,8 @@ func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
 	if isLeader {
 
 		sm.deleteRequestRecordWithIdentity(args.LastReply)
-
 		config := sm.createConfigForJoinOp(args)
-		command := Op{args.Identity, "Append", config.Num, config}
-		sm.curRequest = args.Identity
-
-		flag := 0
-		closeCh := make(chan interface{})
-
-		go func(flag *int) {
-			select {
-			case <-sm.appendCh:
-				*flag = 1
-				return
-			case <-closeCh:
-				return
-			}
-		}(&flag)
-
-		oldIndex, oldTerm, _ := sm.rf.Start(command)
-		time.Sleep(time.Duration(20) * time.Millisecond)
-
-		for index, term := oldIndex, oldTerm; flag == 0 && oldIndex == index && oldTerm == term; {
-			// request to fast will make repeat invoke.
-			index, term, _ = sm.rf.Start(command)
-			time.Sleep(time.Duration(20) * time.Millisecond)
-		}
-
-		// Leader loses its leadership before the request is committed to the log.
-		if flag == 0 {
-			reply.Err = "LoseLeadership"
-			reply.WrongLeader = true
-			close(closeCh) // quit goroutine.
-			return
-		}
-
-		reply.Err = OK
+		reply.Err, reply.WrongLeader = sm.consistentAppend(config, args.Identity)
 	}
 }
 
@@ -194,12 +159,7 @@ func (sm *ShardMaster) createConfigForJoinOp(args *JoinArgs) Config {
 	sm.copyMap(servers, groups)
 	config.Groups = groups
 
-	//sm.hr.addNodes(sm.getKeySet(servers))
-	//for index, _ := range lastConfig.Shards {
-	//	config.Shards[index], _ = strconv.Atoi(sm.hr.getNode(strconv.Itoa(index)))
-	//}
-	//sm.doBalance(&config.Shards)
-
+	// Divide the shards as evenly as possible among the full set of groups.
 	sm.balance(&config.Shards, sm.getKeySet(groups))
 
 	DPrintf("Join：%v current Group：%v Shards %v", args.Servers, config.Groups, config.Shards)
@@ -225,43 +185,8 @@ func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) {
 	if isLeader {
 
 		sm.deleteRequestRecordWithIdentity(args.LastReply)
-
 		config := sm.createConfigForLeaveOp(args)
-
-		command := Op{args.Identity, "Append", config.Num, config}
-		sm.curRequest = args.Identity
-
-		flag := 0
-		closeCh := make(chan interface{})
-
-		go func(flag *int) {
-			select {
-			case <-sm.appendCh:
-				*flag = 1
-				return
-			case <-closeCh:
-				return
-			}
-		}(&flag)
-
-		oldIndex, oldTerm, _ := sm.rf.Start(command)
-		time.Sleep(time.Duration(20) * time.Millisecond)
-
-		for index, term := oldIndex, oldTerm; flag == 0 && oldIndex == index && oldTerm == term; {
-			// request to fast will make repeat invoke.
-			index, term, _ = sm.rf.Start(command)
-			time.Sleep(time.Duration(20) * time.Millisecond)
-		}
-
-		// Leader loses its leadership before the request is committed to the log.
-		if flag == 0 {
-			reply.Err = "LoseLeadership"
-			reply.WrongLeader = true
-			close(closeCh) // quit goroutine.
-			return
-		}
-
-		reply.Err = OK
+		reply.Err, reply.WrongLeader = sm.consistentAppend(config, args.Identity)
 	}
 }
 
@@ -284,12 +209,6 @@ func (sm *ShardMaster) createConfigForLeaveOp(args *LeaveArgs) Config {
 	config.Groups = groups
 
 	// Assigns those groups' shards to the remaining groups.
-	//for index, _ := range lastConfig.Shards {
-	//	config.Shards[index], _ = strconv.Atoi(sm.hr.getNode(strconv.Itoa(index)))
-	//}
-
-	//sm.doBalance(&config.Shards)
-
 	sm.balance(&config.Shards, sm.getKeySet(groups))
 
 	DPrintf("Leave：%v current Group：%v Shards %v", args.GIDs, config.Groups, config.Shards)
@@ -317,40 +236,7 @@ func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
 		sm.deleteRequestRecordWithIdentity(args.LastReply)
 
 		config := sm.createConfigForMoveOp(args)
-		command := Op{args.Identity, "Append", config.Num, config}
-		sm.curRequest = args.Identity
-
-		flag := 0
-		closeCh := make(chan interface{})
-
-		go func(flag *int) {
-			select {
-			case <-sm.appendCh:
-				*flag = 1
-				return
-			case <-closeCh:
-				return
-			}
-		}(&flag)
-
-		oldIndex, oldTerm, _ := sm.rf.Start(command)
-		time.Sleep(time.Duration(20) * time.Millisecond)
-
-		for index, term := oldIndex, oldTerm; flag == 0 && oldIndex == index && oldTerm == term; {
-			// request to fast will make repeat invoke.
-			index, term, _ = sm.rf.Start(command)
-			time.Sleep(time.Duration(20) * time.Millisecond)
-		}
-
-		// Leader loses its leadership before the request is committed to the log.
-		if flag == 0 {
-			reply.Err = "LoseLeadership"
-			reply.WrongLeader = true
-			close(closeCh) // quit goroutine.
-			return
-		}
-
-		reply.Err = OK
+		reply.Err, reply.WrongLeader = sm.consistentAppend(config, args.Identity)
 	}
 }
 
@@ -430,7 +316,47 @@ func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 }
 
 /*
-	util
+ * This method is mainly responsible for implementing fault tolerance by relying on the underlying
+ * Raft algorithm to synchronize server data.
+ */
+func (sm *ShardMaster) consistentAppend(config Config, identity int64) (err Err, wrongLeader bool) {
+
+	command := Op{identity, "Append", config.Num, config}
+	sm.curRequest = identity
+
+	flag := 0
+	closeCh := make(chan interface{})
+
+	go func(flag *int) {
+		select {
+		case <-sm.appendCh:
+			*flag = 1
+			return
+		case <-closeCh:
+			return
+		}
+	}(&flag)
+
+	oldIndex, oldTerm, _ := sm.rf.Start(command)
+	time.Sleep(time.Duration(20) * time.Millisecond)
+
+	for index, term := oldIndex, oldTerm; flag == 0 && oldIndex == index && oldTerm == term; {
+		// request to fast will make repeat invoke.
+		index, term, _ = sm.rf.Start(command)
+		time.Sleep(time.Duration(20) * time.Millisecond)
+	}
+
+	// Leader loses its leadership before the request is committed to the log.
+	if flag == 0 {
+		close(closeCh) // quit goroutine.
+		return "LoseLeadership", true
+	}
+
+	return OK, true
+}
+
+/*
+	Some util function.
 */
 func (sm *ShardMaster) copyMap(src map[int][]string, des map[int][]string) {
 	for key, _ := range src {
@@ -496,27 +422,6 @@ func (sm *ShardMaster) balance(shards *[NShards]int, groups []int) {
 	}
 }
 
-func (sm *ShardMaster) doBalance(shards *[NShards]int) {
-
-	_, maxCount, maxValue, minCount, minValue := ArrayCountValues(*shards)
-
-	for maxCount > minCount+1 {
-
-		count := (maxCount - minCount) / 2
-		for idx, val := range shards {
-			if count == 0 {
-				break
-			}
-			if val == maxValue[0] {
-				shards[idx] = minValue[0]
-				count--
-			}
-		}
-
-		_, maxCount, maxValue, minCount, minValue = ArrayCountValues(*shards)
-	}
-}
-
 func (sm *ShardMaster) findRecordContainIdentity(identity int64, record []int64) bool {
 	for _, value := range record {
 		if value == identity {
@@ -546,54 +451,6 @@ func (sm *ShardMaster) deleteRequestRecordWithIdentity(identity int64) bool {
 
 	sm.requestRecord = append(sm.requestRecord[:index], sm.requestRecord[index+1:]...)
 	return true
-}
-
-//求数组中出现次数最多的值和次数
-func ArrayCountValues(args [NShards]int) (Status bool, MaxCount int, MaxValue []int, MinCount int, MinValue []int) {
-	/*【1】没值直接退出*/
-	if len(args) == 0 {
-		return false, 0, nil, 0, nil
-	}
-
-	/*【2】求出每个值对应出现的次数，例:[值:次数,值:次数]*/
-	newMap := make(map[int]int)
-	for _, value := range args {
-		if newMap[value] != 0 {
-			newMap[value]++
-		} else {
-			newMap[value] = 1
-		}
-	}
-
-	/*【3】求出出现最多的次数*/
-	var allCount []int //所有的次数
-	var maxCount int   //出现最多的次数
-	var minCount int   //出现最少的次数
-	for _, value := range newMap {
-		allCount = append(allCount, value)
-	}
-	maxCount = allCount[0]
-	minCount = allCount[0]
-	for i := 0; i < len(allCount); i++ {
-		if maxCount < allCount[i] {
-			maxCount = allCount[i]
-		} else if minCount > allCount[i] {
-			minCount = allCount[i]
-		}
-	}
-
-	/*【4】求数组中出现次数最多的值，例：[8,9]这个两个值出现的次数一样多*/
-	var maxValue []int
-	var minValue []int
-	for key, value := range newMap {
-		if value == maxCount {
-			maxValue = append(maxValue, key)
-		} else if value == minCount {
-			minValue = append(minValue, key)
-		}
-	}
-
-	return true, maxCount, maxValue, minCount, minValue
 }
 
 func (sm *ShardMaster) initApplyCommand() {
