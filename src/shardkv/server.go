@@ -26,9 +26,11 @@ type Op struct {
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
 	Identity  int64
-	Operation string // Get | Put | Append
+	Operation string // Get | Put | Append | Config
 	Key       string
 	Value     string
+	Config    shardmaster.Config
+	Shards    []int
 }
 
 type ShardKV struct {
@@ -48,18 +50,25 @@ type ShardKV struct {
 	curRequest    int64   // the identity of current request which is processing.
 	requestRecord []int64 // slice of identity which client has got the request of this identity.
 
-	applyGetCh       chan string // Notify the Append method when it receives an ApplyMsg of type Get.
-	applyPutAppendCh chan int64  // Notify the Append method when it receives an ApplyMsg of type Append and Put.
+	applyGetCh          chan string // Notify the Append method when it receives an ApplyMsg of type Get.
+	applyPutAppendCh    chan int64  // Notify the Append method when it receives an ApplyMsg of type Append and Put.
+	applyConfigCh       chan map[int][]int
+	applyConfigAcceptCh chan int64
+	applyTransferCh     chan int64
 
-	dispatchCh  chan string // channel to lock Func so that Func can execute linearly.
-	getCh       chan int    // channel for Get unlock Func.
-	putAppendCh chan int    // channel for PutAppend unlock Func.
+	dispatchCh       chan string // channel to lock Func so that Func can execute linearly.
+	getCh            chan int    // channel for Get unlock Func.
+	putAppendCh      chan int    // channel for PutAppend unlock Func.
+	transferShardsCh chan int
+	synchronizeCh    chan int
 
 	internalSnapshotCh chan raft.Snapshot // snapshot
 	snapshotCh         chan raft.Snapshot // snapshot
 
 	config           shardmaster.Config
 	shardMasterClerk *shardmaster.Clerk
+
+	doSynchronize bool
 }
 
 func (kv *ShardKV) initDispatch() {
@@ -67,6 +76,8 @@ func (kv *ShardKV) initDispatch() {
 	kv.dispatchCh = make(chan string)
 	kv.getCh = make(chan int)
 	kv.putAppendCh = make(chan int)
+	kv.synchronizeCh = make(chan int)
+	kv.transferShardsCh = make(chan int)
 	go kv.doDispatch()
 }
 
@@ -93,6 +104,22 @@ func (kv *ShardKV) doDispatch() {
 				kv.putAppendCh <- 1
 			}
 
+		case "synchronize":
+			if lock {
+				queue = append(queue, request)
+			} else {
+				lock = true
+				kv.synchronizeCh <- 1
+			}
+
+		case "transferShards":
+			if lock {
+				queue = append(queue, request)
+			} else {
+				lock = true
+				kv.transferShardsCh <- 1
+			}
+
 		case "end":
 			if len(queue) > 0 {
 				item := queue[0]
@@ -104,6 +131,10 @@ func (kv *ShardKV) doDispatch() {
 					kv.getCh <- 1
 				case "putAppend":
 					kv.putAppendCh <- 1
+				case "synchronize":
+					kv.synchronizeCh <- 1
+				case "transferShards":
+					kv.transferShardsCh <- 1
 				}
 			} else {
 				lock = false
@@ -115,31 +146,35 @@ func (kv *ShardKV) doDispatch() {
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 
+	DPrintf("Gid %v Server %v Get A.", kv.gid, kv.me)
+
 	kv.dispatchCh <- "get"
 	<-kv.getCh
 	defer func() { kv.dispatchCh <- "end" }()
 
-	if ok := kv.shouldResponsibleForKey(args.Key); !ok {
-		reply.Key = args.Key
-		reply.Err = ErrWrongGroup
-	}
-
 	_, isLeader := kv.rf.GetState()
 	reply.WrongLeader = !isLeader
 
-	// Cope with duplicate Clerk requests.
-	if kv.findRecordContainIdentity(args.Identity, kv.requestRecord) {
-		reply.Err = OK
-		reply.Value = kv.getValue(args.Key)
-		return
-	}
-
 	if isLeader {
+		DPrintf("Gid %v Server %v Get B. Shards %v", kv.gid, kv.me, kv.config.Shards)
+
+		if ok := kv.shouldResponsibleForKey(args.Key); !ok {
+			reply.Key = args.Key
+			reply.Err = ErrWrongGroup
+			return
+		}
+
+		// Cope with duplicate Clerk requests.
+		if kv.findRecordContainIdentity(args.Identity, kv.requestRecord) {
+			reply.Value = kv.getValue(args.Key)
+			reply.Err = OK
+			return
+		}
 
 		// delete unused record.
 		kv.deleteRequestRecordWithIdentity(args.LastReply)
 
-		command := Op{args.Identity, "Get", args.Key, ""}
+		command := Op{args.Identity, "Get", args.Key, "", shardmaster.Config{}, nil}
 		kv.curRequest = args.Identity
 
 		flag := 0
@@ -149,6 +184,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 			select {
 			case value := <-kv.applyGetCh:
 				reply.Value = value
+				reply.Err = OK
 				*flag = 1
 				return
 			case <-closeCh:
@@ -161,6 +197,13 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 
 		for index, term := oldIndex, oldTerm; flag == 0 && oldIndex == index && oldTerm == term; {
 			// request to fast will make repeat invoke.
+			if gid := kv.config.Shards[key2shard(args.Key)]; gid != kv.gid {
+				close(closeCh) // quit goroutine.
+				reply.Key = args.Key
+				reply.Err = ErrWrongGroup
+				return
+			}
+
 			index, term, _ = kv.rf.Start(command)
 			time.Sleep(time.Duration(20) * time.Millisecond)
 		}
@@ -173,7 +216,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 			return
 		}
 
-		if reply.Err = OK; len(reply.Value) == 0 {
+		if reply.Err == OK && len(reply.Value) == 0 {
 			reply.Err = ErrNoKey
 		}
 	}
@@ -183,30 +226,37 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 
+	DPrintf("Gid %v Server %v Put Append. A", kv.gid, kv.me)
+
 	kv.dispatchCh <- "putAppend"
 	<-kv.putAppendCh
 	defer func() { kv.dispatchCh <- "end" }()
 
-	if ok := kv.shouldResponsibleForKey(args.Key); !ok {
-		reply.Key = args.Key
-		reply.Err = ErrWrongGroup
-	}
+	DPrintf("Gid %v Server %v Put Append. B", kv.gid, kv.me)
 
 	_, isLeader := kv.rf.GetState()
 	reply.WrongLeader = !isLeader
 
-	// Cope with duplicate Clerk requests.
-	if kv.findRecordContainIdentity(args.Identity, kv.requestRecord) {
-		reply.Err = OK
-		return
-	}
-
 	if isLeader {
+
+		DPrintf("Gid %v Server %v Put Append. C", kv.gid, kv.me)
+
+		if ok := kv.shouldResponsibleForKey(args.Key); !ok {
+			reply.Key = args.Key
+			reply.Err = ErrWrongGroup
+			return
+		}
+
+		// Cope with duplicate Clerk requests.
+		if kv.findRecordContainIdentity(args.Identity, kv.requestRecord) {
+			reply.Err = OK
+			return
+		}
 
 		// delete unused record.
 		kv.deleteRequestRecordWithIdentity(args.LastReply)
 
-		command := Op{args.Identity, args.Op, args.Key, args.Value}
+		command := Op{args.Identity, args.Op, args.Key, args.Value, shardmaster.Config{}, nil}
 		kv.curRequest = args.Identity
 
 		flag := 0
@@ -227,6 +277,13 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 		for index, term := oldIndex, oldTerm; flag == 0 && oldIndex == index && oldTerm == term; {
 			// request to fast will make repeat invoke.
+			if gid := kv.config.Shards[key2shard(args.Key)]; gid != kv.gid {
+				close(closeCh) // quit goroutine.
+				reply.Key = args.Key
+				reply.Err = ErrWrongGroup
+				return
+			}
+
 			index, term, _ = kv.rf.Start(command)
 			time.Sleep(time.Duration(20) * time.Millisecond)
 		}
@@ -236,31 +293,86 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 			reply.Err = "LoseLeadership"
 			reply.WrongLeader = true
 			close(closeCh) // quit goroutine.
+			DPrintf("Put Append. D")
 			return
 		}
-	}
-	reply.Err = OK
 
+		reply.Err = OK
+	}
 }
 
 func (kv *ShardKV) TransferShards(args *TransferShardsArgs, reply *TransferShardsReply) {
 
-	DPrintf("Gid %v Server %v Get transfer shards old %v new %v", kv.gid, kv.me, kv.config.Shards, args.Shards)
+	DPrintf("Gid %v Server %v Get transfer A shards old %v new %v", kv.gid, kv.me, kv.config.Shards, args.Shards)
 
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
+	_, isLeader := kv.rf.GetState()
+	reply.WrongLeader = !isLeader
+	reply.Err = OK
 
-	if args.ConfigNum > kv.config.Num {
+	if isLeader {
+
+		DPrintf("Gid %v Server %v Get transfer B shards old %v new %v", kv.gid, kv.me, kv.config.Shards, args.Shards)
+
+		DPrintf("Gid %v Server %v Tran Lock", kv.gid, kv.me)
+		kv.dispatchCh <- "transferShards"
+		<-kv.transferShardsCh
+		defer func() {
+			kv.dispatchCh <- "end"
+			DPrintf("Gid %v Server %v Tran UnLock", kv.gid, kv.me)
+		}()
+
+		DPrintf("Gid %v Server %v Get transfer C shards old %v new %v", kv.gid, kv.me, kv.config.Shards, args.Shards)
+
 		for key, val := range args.Logs {
-			kv.log[key] = val
+
+			DPrintf("TRAN key %v BEG.", key)
+
+			identity := nrand()
+			command := Op{identity, "Transfer", key, val, shardmaster.Config{}, nil}
+			kv.curRequest = identity
+
+			flag := 0
+			closeCh := make(chan interface{})
+
+			go func(flag *int) {
+				DPrintf("open normal %v", identity)
+				select {
+				case <-kv.applyTransferCh:
+					*flag = 1
+					DPrintf("close normal.%v", identity)
+					return
+				case <-closeCh:
+					DPrintf("close normal.%v", identity)
+					return
+				}
+			}(&flag)
+
+			oldIndex, oldTerm, _ := kv.rf.Start(command)
+			time.Sleep(time.Duration(20) * time.Millisecond)
+
+			for index, term := oldIndex, oldTerm; flag == 0 && oldIndex == index && oldTerm == term; {
+				// request to fast will make repeat invoke.
+				index, term, _ = kv.rf.Start(command)
+				time.Sleep(time.Duration(20) * time.Millisecond)
+			}
+
+			if flag == 0 {
+				close(closeCh) // quit goroutine.
+				break
+			}
+
+			DPrintf("TRAN key %v END.", key)
 		}
 
-		DPrintf("Gid %v Server %v current ConfigNum %v log %v", kv.gid, kv.me, kv.config.Num, kv.log)
+		DPrintf("TRAN key OVER.")
 
-		// update Config to make new shards visible.
-		kv.updateConfigToAcceptSomeRequest(args.Shards)
-		kv.config.Num = args.ConfigNum
-		reply.Err = OK
+		go func(shards []int) {
+			var transferShards []int
+			for _, shard := range shards {
+				transferShards = append(transferShards, shard)
+			}
+			kv.updateConfigToAcceptSomeRequest(transferShards)
+		}(args.Shards)
 	}
 }
 
@@ -277,6 +389,9 @@ func (kv *ShardKV) initLog() {
 func (kv *ShardKV) initApplyCommand() {
 	kv.applyGetCh = make(chan string)
 	kv.applyPutAppendCh = make(chan int64)
+	kv.applyConfigCh = make(chan map[int][]int)
+	kv.applyConfigAcceptCh = make(chan int64)
+	kv.applyTransferCh = make(chan int64)
 	go kv.doApplyCommand()
 }
 
@@ -288,14 +403,17 @@ func (kv *ShardKV) doApplyCommand() {
 
 			command, _ := applyMsg.Command.(Op)
 
+			DPrintf("Gid %v Server %v deal command %v +A+", kv.gid, kv.me, command)
+
 			// 1. Judge according to Identity, skip if the current request has been processed.
 			// 2. All group members agree on a reconfiguration occurs after client Put/Append/Get requests.
 			//    So the Put won't take effect and client must re-try at the new owner.
-			if gid := kv.config.Shards[key2shard(command.Key)]; kv.findRecordContainIdentity(command.Identity, kv.requestRecord) || gid != kv.gid {
+			if gid := kv.config.Shards[key2shard(command.Key)]; kv.findRecordContainIdentity(command.Identity, kv.requestRecord) || (command.Operation != "Transfer" && command.Operation != "Config" && command.Operation != "ConfigAccept" && gid != kv.gid) {
 				continue
 			}
 
-			DPrintf("Gid %v Server %v deal command %v", kv.gid, kv.me, command)
+			DPrintf("Gid %v Server %v deal command %v A", kv.gid, kv.me, command)
+			DPrintf("Gid %v Server %v current shards %v A", kv.gid, kv.me, kv.config.Shards)
 
 			// Cope with duplicate Clerk requests.
 			kv.requestRecord = append(kv.requestRecord, command.Identity)
@@ -318,14 +436,42 @@ func (kv *ShardKV) doApplyCommand() {
 					kv.applyPutAppendCh <- command.Identity
 				}
 
+			case "Transfer":
+				kv.putValue(command.Key, command.Value)
+				if command.Identity == kv.curRequest {
+					DPrintf("Send to Channel.")
+					kv.applyTransferCh <- command.Identity
+				}
+
+			case "Config":
+				transferShards := kv.shieldInvalidShards(command.Config)
+				if command.Identity == kv.curRequest {
+					kv.applyConfigCh <- transferShards
+				}
+
+				DPrintf("Gid %v Server %v current shards %v B", kv.gid, kv.me, kv.config.Shards)
+
+			case "ConfigAccept":
+				for _, shard := range command.Shards {
+					kv.config.Shards[shard] = kv.gid
+				}
+				if command.Identity == kv.curRequest {
+					kv.applyConfigAcceptCh <- command.Identity
+				}
+
 			default:
 				// do nothing.
 			}
+
+			DPrintf("Gid %v Server %v deal command %v B", kv.gid, kv.me, command)
 
 			// should do after apply command.
 			if kv.maxraftstate != -1 && kv.persister.RaftStateSize() >= kv.maxraftstate*9/10 {
 				kv.internalSnapshotCh <- applyMsg.Snapshot // snapshot
 			}
+
+			DPrintf("Gid %v Server %v deal command %v C", kv.gid, kv.me, command)
+
 		} else {
 			// do snapshot
 			kv.log = applyMsg.Snapshot.StateMachineState
@@ -378,21 +524,65 @@ func (kv *ShardKV) initFetchConfiguration() {
 
 func (kv *ShardKV) doFetchConfiguration() {
 	for {
-		config := kv.shardMasterClerk.Query(-1)
-
 		if kv.config.Shards[0] == 0 {
+			config := kv.shardMasterClerk.Query(-1)
 			DPrintf("Gid %v Server %v init config %v", kv.gid, kv.me, config)
 			kv.config = config
 		}
 
-		old := kv.config
-		if shouldTransferShards, shards := kv.updateConfigToRejectSomeRequest(config); shouldTransferShards {
-			DPrintf("Gid %v Server %v Need to transfer shards old %v new %v", kv.gid, kv.me, old, config.Shards)
-			kv.config.Num = config.Num
+		// Only Leader do fetch.
+		if _, isLeader := kv.rf.GetState(); isLeader {
 
-			kv.transferShards(shards, config)
+			config := kv.shardMasterClerk.Query(-1)
+			DPrintf("Gid %v Server %v CURRENT %v NEW %v", kv.gid, kv.me, kv.config.Shards, config)
+
+			old := kv.config
+			if needUpdateShards := kv.needUpdateShards(config); needUpdateShards {
+
+				DPrintf("Gid %v Server %v Config Lock", kv.gid, kv.me)
+				kv.dispatchCh <- "synchronize"
+				<-kv.synchronizeCh
+
+				DPrintf("Gid %v Server %v Need to transfer shards old %v new %v", kv.gid, kv.me, old, config.Shards)
+
+				identity := nrand()
+				// do consistent.
+				command := Op{identity, "Config", "", "", config, nil}
+				kv.curRequest = identity
+
+				flag := 0
+				closeCh := make(chan interface{})
+
+				go func(flag *int) {
+					select {
+					case transferShards := <-kv.applyConfigCh:
+						kv.transferShards(transferShards, command.Config)
+						*flag = 1
+						return
+					case <-closeCh:
+						return
+					}
+				}(&flag)
+
+				oldIndex, oldTerm, _ := kv.rf.Start(command)
+				time.Sleep(time.Duration(20) * time.Millisecond)
+
+				for index, term := oldIndex, oldTerm; flag == 0 && oldIndex == index && oldTerm == term; {
+					// request to fast will make repeat invoke.
+					index, term, _ = kv.rf.Start(command)
+					time.Sleep(time.Duration(20) * time.Millisecond)
+				}
+
+				if flag == 0 {
+					close(closeCh) // quit goroutine.
+				}
+				// kv.transferShards(shards, config)
+
+				kv.dispatchCh <- "end"
+				DPrintf("Gid %v Server %v Config Lock", kv.gid, kv.me)
+			}
+
 		}
-
 		// periodically poll the shardmaster to learn about new configurations.
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -439,9 +629,9 @@ func (kv *ShardKV) getServersByGid(gid int, config shardmaster.Config) []string 
 
 func (kv *ShardKV) transferShardsToOneGroup(gid int, logs map[string]string, shards []int, servers []string, configNum int) {
 
-	for idx, server := range servers {
-		// concurrent.
-		go func(server string) {
+	for {
+		for idx, server := range servers {
+			// concurrent.
 			srv := kv.make_end(server)
 			args := TransferShardsArgs{configNum, shards, logs}
 			var reply TransferShardsReply
@@ -449,11 +639,42 @@ func (kv *ShardKV) transferShardsToOneGroup(gid int, logs map[string]string, sha
 			DPrintf("Send to %v transfer RPC %v", idx, args)
 
 			ok := srv.Call("ShardKV.TransferShards", &args, &reply)
-			if ok && reply.Err == OK {
-				// do nothing.
+			if ok && reply.Err == OK && reply.WrongLeader == false {
+				return
 			}
-		}(server)
+		}
 	}
+}
+
+func (kv *ShardKV) needUpdateShards(config shardmaster.Config) bool {
+	needUpdateShards := false
+	newShards := config.Shards
+	for shard, gid := range kv.config.Shards {
+		if gid == kv.gid && newShards[shard] != gid {
+			needUpdateShards = true
+			break
+		}
+	}
+
+	DPrintf("Should update %v config %v current %v", needUpdateShards, config.Shards, kv.config.Shards)
+	return needUpdateShards
+}
+
+func (kv *ShardKV) shieldInvalidShards(config shardmaster.Config) map[int][]int {
+
+	shards := make(map[int][]int) // gid -> shards[]
+	newShards := config.Shards
+
+	for shard, gid := range kv.config.Shards {
+		if gid == kv.gid && newShards[shard] != gid {
+			newGid := newShards[shard]
+			// shield shards which has not responsible by current server.
+			kv.config.Shards[shard] = newGid
+			shards[newGid] = append(shards[newGid], shard)
+		}
+	}
+
+	return shards
 }
 
 /*
@@ -489,9 +710,46 @@ func (kv *ShardKV) updateConfigToRejectSomeRequest(config shardmaster.Config) (b
  * over the old shard data before accepting requests for that shard.
  */
 func (kv *ShardKV) updateConfigToAcceptSomeRequest(shards []int) {
-	for _, shard := range shards {
-		kv.config.Shards[shard] = kv.gid
+
+	DPrintf("Config Accept.")
+
+	kv.dispatchCh <- "synchronize"
+	<-kv.synchronizeCh
+
+	identity := nrand()
+	// do consistent.
+	DPrintf("Shards %v", shards)
+	command := Op{identity, "ConfigAccept", "", "", shardmaster.Config{}, shards}
+	kv.curRequest = identity
+
+	flag := 0
+	closeCh := make(chan interface{})
+
+	go func(flag *int) {
+		select {
+		case <-kv.applyConfigAcceptCh:
+			*flag = 1
+			return
+		case <-closeCh:
+			return
+		}
+	}(&flag)
+
+	oldIndex, oldTerm, _ := kv.rf.Start(command)
+	time.Sleep(time.Duration(20) * time.Millisecond)
+
+	for index, term := oldIndex, oldTerm; flag == 0 && oldIndex == index && oldTerm == term; {
+		// request to fast will make repeat invoke.
+		index, term, _ = kv.rf.Start(command)
+		time.Sleep(time.Duration(20) * time.Millisecond)
 	}
+
+	if flag == 0 {
+		close(closeCh) // quit goroutine.
+	}
+	// kv.transferShards(shards, config)
+
+	kv.dispatchCh <- "end"
 }
 
 func (kv *ShardKV) shouldResponsibleForKey(key string) bool {

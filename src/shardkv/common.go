@@ -59,7 +59,8 @@ type TransferShardsArgs struct {
 }
 
 type TransferShardsReply struct {
-	Err Err
+	WrongLeader bool
+	Err         Err
 }
 
 type SynchronizeConfigArgs struct {
