@@ -57,6 +57,7 @@ type Snapshot struct {
 	LastIncludeTerm   int
 	StateMachineState map[string]string
 	RequestRecord     []int64 // detect duplicated operations
+	Shards            []int   // kvShard
 }
 
 //
@@ -824,7 +825,7 @@ func (rf *Raft) updateLastApplyIndex() {
 	for {
 		if rf.commitIndex > rf.lastApplied {
 			rf.lastApplied++
-			snapshot := Snapshot{rf.lastApplied, rf.getTermByLogIndex(rf.lastApplied), nil, nil} // Snapshot
+			snapshot := Snapshot{rf.lastApplied, rf.getTermByLogIndex(rf.lastApplied), nil, nil, nil} // Snapshot
 			NPrintf("peer %d TEST A. snapshot %v", rf.me, snapshot)
 			rf.applyCh <- ApplyMsg{true, rf.getLogByLogIndex(rf.lastApplied).Command, rf.lastApplied, snapshot}
 			NPrintf("peer %d TEST B.", rf.me)
